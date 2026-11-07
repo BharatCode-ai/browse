@@ -1,10 +1,6 @@
 // The onboarding page (onboarding.html): opened on install, and by the toolbar button while this browser isn't paired.
-// One card, laid out like Console's Connect OpenCode guide: a tab for an agent on this computer and one for an agent on
-// another computer, each a few numbered steps that check themselves off from the worker's state and the first agent
-// tab.
 import { createEffect, createMemo, createSignal, Match, onCleanup, Show, Switch, type JSX } from "solid-js"
 import { render } from "solid-js/web"
-import { Tabs } from "@kobalte/core/tabs"
 import { Button } from "@opencode/ui/button"
 import { Icon } from "@opencode/ui/icon"
 import { IconButton } from "@opencode/ui/icon-button"
@@ -12,7 +8,7 @@ import { TextInput } from "@opencode/ui/text-input"
 import { unpackedExtensionId, unpackedReloadAdvice } from "../../cli/src/protocol"
 import { firstRunStep, relayProbeResult, shouldProbe, type FirstRunStep, type RelayProbe } from "./first-run"
 import { TRY_PROMPT, checklist } from "./checklist"
-import { installCommand, remoteInstallCommand } from "./install"
+import { remoteInstallCommand } from "./install"
 import { RelayForm } from "./relay-form"
 import { applyColorScheme, Brand, createFlash, createRelay, Note, Rich, type Relay } from "./ui"
 import "./onboarding.css"
@@ -25,10 +21,8 @@ const installTab = !!fragmentCode
 if (/^#(code|ticket|pair)=/.test(location.hash)) history.replaceState(null, "", location.pathname + location.search)
 
 const settingsUrl = () => chrome.runtime.getURL("settings.html")
-const AGENT_PROMPT = "Use BharatCode Browse to open example.com and tell me the page title."
 
 type Where = "here" | "remote"
-type How = "agent" | "manual"
 
 function Onboarding() {
   const relay = createRelay()
@@ -39,7 +33,6 @@ function Onboarding() {
   const [pairedBy, setPairedBy] = createSignal<"link" | "code">()
   const [linkNote, setLinkNote] = createSignal<string>()
   const [where, setWhere] = createSignal<Where>()
-  const [how, setHow] = createSignal<How>("manual")
 
   const step = createMemo(() => firstRunStep(relay.state(), installWaiting() ? "install-waiting" : probe()))
   const list = createMemo(() => checklist({ state: relay.state(), wasConnected: wasConnected(), tried: tried() }))
@@ -104,53 +97,21 @@ function Onboarding() {
   }
   onCleanup(() => clearTimeout(probeTimer))
 
-  const tryIt = (number: number) => (
+  const tryIt = (number: number, desktop = true) => (
     <Step
       number={number}
-      title="Try it"
+      title={desktop ? "Finish in BharatCode Desktop" : "Try your connection"}
       done={list().tryIt === "done"}
-      description={list().tryIt === "done" ? "Your agent opened a tab. BharatCode Browse is ready." : "Ask your agent something like:"}
+      description={
+        list().tryIt === "done"
+          ? "Your agent opened a tab. BharatCode Browse is ready."
+          : desktop
+            ? "Select Check connection in Desktop, then try this prompt in a chat."
+            : "Try this prompt in a chat with your agent."
+      }
     >
       <Show when={list().tryIt !== "done"}>
         <Command text={TRY_PROMPT} label="Copy prompt" />
-        <Show when={connected()}>
-          <Waiting>Watching for your agent's first tab…</Waiting>
-        </Show>
-      </Show>
-    </Step>
-  )
-
-  const installStep = (how: How) => (
-    <Step
-      number={1}
-      title={how === "agent" ? "Paste this into your agent" : "Connect to BharatCode Desktop"}
-      done={connected()}
-      description={
-        connected() ? (
-          <AgentDone relay={relay} pairedBy={pairedBy()} />
-        ) : how === "agent" ? (
-          "Once your browser is connected, try this prompt in BharatCode Desktop."
-        ) : (
-          "In BharatCode Desktop, open Settings → General → Connect browser and generate a pairing code."
-        )
-      }
-    >
-      <Show when={!connected()}>
-        <AgentStep
-          relay={relay}
-          step={step()}
-          command={
-            how === "agent" ? (
-              <Command text={AGENT_PROMPT} label="Copy prompt" />
-            ) : (
-              <a class="link" href="https://github.com/arzvaak/browse#desktop-preview" target="_blank" rel="noreferrer">
-                Setup instructions
-              </a>
-            )
-          }
-          linkNote={linkNote()}
-          onPaired={() => setPairedBy("code")}
-        />
       </Show>
     </Step>
   )
@@ -162,7 +123,7 @@ function Onboarding() {
       <section class="guide" aria-labelledby="guide-title">
         <header class="guide-head">
           <h1 id="guide-title" class="guide-title">
-            {remote() ? "Connect an agent on another computer" : "Connect your agent"}
+            {remote() ? "Connect an agent on another computer" : "Connect your browser"}
             <Show when={connected()}>
               <span class="guide-connected">
                 <span aria-hidden="true">·</span>
@@ -171,7 +132,7 @@ function Onboarding() {
             </Show>
           </h1>
           <p class="guide-sub">
-            <Show when={remote()} fallback="This page checks each step as it happens.">
+            <Show when={remote()} fallback="Let your BharatCode agent open tabs and work in tabs you share.">
               For an agent on a server, a dev box or another laptop.{" "}
               <button type="button" class="link" onClick={() => setWhere("here")}>
                 Agent on this computer?
@@ -183,30 +144,30 @@ function Onboarding() {
         <Show
           when={remote()}
           fallback={
-            <Tabs value={how()} onChange={(value) => setHow(value as How)}>
-              <Tabs.List class="tabs" aria-label="How to set it up">
-                <Tabs.Trigger class="tab" value="agent">
-                  <span>Ask your agent</span>
-                </Tabs.Trigger>
-                <Tabs.Trigger class="tab" value="manual">
-                  <span>Do it yourself</span>
-                </Tabs.Trigger>
-                <Tabs.Indicator class="tab-indicator" />
-              </Tabs.List>
+            <>
               <div class="hr" />
-              <Tabs.Content class="guide-body" value="agent">
+              <div class="guide-body">
                 <div class="steps">
-                  {installStep("agent")}
-                  {tryIt(2)}
+                  <Step
+                    number={1}
+                    title="Pair with BharatCode Desktop"
+                    done={connected()}
+                    description={
+                      connected() ? (
+                        <AgentDone relay={relay} pairedBy={pairedBy()} />
+                      ) : (
+                        <>Open <strong>Settings → General → Connect browser</strong> in Desktop to get a one-time code.</>
+                      )
+                    }
+                  >
+                    <Show when={!connected()}>
+                      <AgentStep relay={relay} step={step()} linkNote={linkNote()} onPaired={() => setPairedBy("code")} />
+                    </Show>
+                  </Step>
+                  <Show when={connected()}>{tryIt(2)}</Show>
                 </div>
-              </Tabs.Content>
-              <Tabs.Content class="guide-body" value="manual">
-                <div class="steps">
-                  {installStep("manual")}
-                  {tryIt(2)}
-                </div>
-              </Tabs.Content>
-            </Tabs>
+              </div>
+            </>
           }
         >
           <div class="hr" />
@@ -235,33 +196,27 @@ function Onboarding() {
                   <RelayForm relay={relay} remote />
                 </Show>
               </Step>
-              {tryIt(3)}
+              <Show when={connected()}>{tryIt(3, false)}</Show>
             </div>
           </div>
         </Show>
 
-        <Show when={!remote() && !list().finished}>
-          <div class="hr" />
-          <footer class="guide-foot">
-            <span class="muted">
-              Agent on another computer?{" "}
-              <button type="button" class="link" onClick={() => setWhere("remote")}>
-                Connect to it
-              </button>
-            </span>
-          </footer>
-        </Show>
-
-        <Show when={list().finished}>
-          <div class="hr" />
-          <footer class="guide-foot">
-            <Button variant="neutral" size="large" onClick={() => location.assign(settingsUrl())}>
-              Open settings
-            </Button>
-            <span class="sep" aria-hidden="true" />
-            <span class="muted">You're set. When an agent needs you for a login, the page shows a card.</span>
-          </footer>
-        </Show>
+        <div class="hr" />
+        <footer class="guide-foot">
+          <Show when={!connected() && !remote()}>
+            <button type="button" class="link" onClick={() => setWhere("remote")}>
+              Use a relay on another computer
+            </button>
+          </Show>
+          <Show when={connected()}>
+            <button type="button" class="link" onClick={() => location.assign(settingsUrl())}>
+              Extension settings
+            </button>
+          </Show>
+          <a class="link" href="https://github.com/arzvaak/browse#desktop-preview" target="_blank" rel="noreferrer">
+            Setup guide
+          </a>
+        </footer>
       </section>
     </main>
   )
@@ -292,19 +247,11 @@ function Step(props: { number: number; title: string; description?: JSX.Element;
   )
 }
 
-/** A command or prompt to copy: [picker ▾ | text ⧉]. */
-function Command(props: { text: string; label: string; picker?: JSX.Element }) {
+/** A command or prompt to copy. */
+function Command(props: { text: string; label: string }) {
   const [copied, flash] = createFlash("copy", "check")
   return (
     <div class="cmd">
-      <Show when={props.picker}>
-        {(picker) => (
-          <>
-            {picker()}
-            <span class="cmd-sep" />
-          </>
-        )}
-      </Show>
       <div class="cmd-text">
         <code>{props.text}</code>
         <IconButton
@@ -319,7 +266,6 @@ function Command(props: { text: string; label: string; picker?: JSX.Element }) {
   )
 }
 
-/** The install method picker that sits on the left of a command box. */
 function Waiting(props: { children: JSX.Element }) {
   return (
     <p class="waiting" aria-live="polite">
@@ -349,59 +295,51 @@ function AgentDone(props: { relay: Relay; pairedBy: "link" | "code" | undefined 
   )
 }
 
-/** Step 1 on this computer: the prompt or command that installs browse, and whatever the connection says to do next. */
+/** Pairing and recovery controls for the relay on this computer. */
 function AgentStep(props: {
   relay: Relay
   step: FirstRunStep
-  command: JSX.Element
   linkNote: string | undefined
   onPaired: () => void
 }) {
   const here = (remote: string | undefined) => (remote ? `the relay at ${remote}` : "the relay on this computer")
-  const capitalized = (text: string) => text.charAt(0).toUpperCase() + text.slice(1)
   const kind = () => props.step.kind
-  const remote = () => ("remote" in props.step ? props.step.remote : undefined)
   const unpacked = () => (props.step.kind === "update-extension" ? props.step.unpacked || chrome.runtime.id === unpackedExtensionId : false)
-  const showInstall = () => kind() === "install" || (kind() === "pair" && !remote()) || kind() === "mismatch"
+  const showCode = () => {
+    const step = props.step
+    return (
+      step.kind === "checking" ||
+      step.kind === "install" ||
+      step.kind === "pair" ||
+      (step.kind === "connecting" && step.pairing) ||
+      (step.kind === "waiting" && step.pairing === "code")
+    )
+  }
 
   return (
     <>
-      <Show when={showInstall()}>{props.command}</Show>
+      <Show when={showCode()}>
+        <CodeForm relay={props.relay} onPaired={props.onPaired} />
+      </Show>
 
       <Switch>
-        <Match when={kind() === "checking"}>
-          <Waiting>Checking…</Waiting>
-        </Match>
-        <Match when={kind() === "install"}>
-          <Waiting>Waiting for your agent to connect…</Waiting>
-        </Match>
         <Match when={kind() === "finishing"}>
           <Waiting>Finishing setup from your terminal. Keep install running.</Waiting>
         </Match>
-        <Match when={props.step.kind === "pair" && props.step}>
+        <Match when={props.step.kind === "pair" && props.step.reason !== "unpaired" && props.step}>
           {(pair) => (
-            <>
-              <Note tone="warn">
-                {pair().reason === "code-rejected"
-                  ? `${capitalized(here(pair().remote))} didn't accept the pairing code: it was mistyped, already used or expired.`
-                  : pair().reason === "refused"
-                    ? `${capitalized(here(pair().remote))} refused this browser's pairing: it was unpaired there, or that relay is a new install.`
-                    : `browse found ${here(pair().remote)}, but this browser isn't paired with it yet.`}{" "}
-                {pair().remote ? "" : "Generate a pairing code in BharatCode Desktop."}
-              </Note>
-              <CodeForm
-                relay={props.relay}
-                label={pair().remote ? "Run `browse pair` on that computer and enter the code it prints:" : "Enter the code from BharatCode Desktop:"}
-                onPaired={props.onPaired}
-              />
-            </>
+            <Note tone="warn">
+              {pair().reason === "code-rejected"
+                ? "This code was rejected. It may have expired or already been used. Generate a new one in Desktop."
+                : "Desktop no longer recognizes this browser. Generate a fresh pairing code in Desktop."}
+            </Note>
           )}
         </Match>
         <Match when={props.step.kind === "waiting" && props.step}>
           {(waiting) =>
             waiting().pairing === "code" ? (
               <Waiting>
-                Code saved. It pairs as soon as {here(waiting().remote)} runs, within 10 minutes of <code>pair</code>.
+                Code saved. Pairing resumes when {here(waiting().remote)} starts, as long as the code is still valid.
               </Waiting>
             ) : (
               <Waiting>Paired with {here(waiting().remote)}. The relay starts when your agent uses the browse tools.</Waiting>
@@ -412,11 +350,7 @@ function AgentStep(props: {
           {(connecting) => <Waiting>{connecting().pairing ? "Pairing" : "Connecting"} with {here(connecting().remote)}…</Waiting>}
         </Match>
         <Match when={kind() === "update-cli"}>
-          <Note tone="warn">
-            This extension is newer than the browse CLI on this computer. Run this, then restart your agent. (With automatic
-            updates on, the CLI catches up by itself within a day.)
-          </Note>
-          <Command text={installCommand} label="Copy command" />
+          <Note tone="warn">This extension needs a newer BharatCode Desktop build. Update Desktop and try again.</Note>
         </Match>
         <Match when={kind() === "update-extension"}>
           <Show
@@ -439,7 +373,7 @@ function AgentStep(props: {
           </Show>
         </Match>
         <Match when={kind() === "mismatch"}>
-          <Note tone="warn">This extension and the browse CLI on this computer don't match. Run install again, then reconnect.</Note>
+          <Note tone="warn">The extension and relay versions differ. Load the extension folder shown by Desktop, then reconnect.</Note>
           <div class="actions">
             <Button variant="neutral" icon="refresh" onClick={() => props.relay.send({ type: "agents.reconnect" })}>
               Reconnect
@@ -448,8 +382,7 @@ function AgentStep(props: {
         </Match>
         <Match when={kind() === "conflict"}>
           <Note tone="warn">
-            browse in another browser or profile holds the relay's connection. Close it there (or quit that browser), then
-            reconnect.
+            Another browser or profile is using this connection. Close BharatCode Browse there, then reconnect.
           </Note>
           <div class="actions">
             <Button variant="neutral" icon="refresh" onClick={() => props.relay.send({ type: "agents.reconnect" })}>
@@ -465,7 +398,7 @@ function AgentStep(props: {
 }
 
 /** A pairing code for the relay the extension already points at. */
-function CodeForm(props: { relay: Relay; label: string; onPaired: () => void }) {
+function CodeForm(props: { relay: Relay; onPaired: () => void }) {
   const [code, setCode] = createSignal("")
   const [pending, setPending] = createSignal(false)
   const [note, setNote] = createSignal<string>()
@@ -474,7 +407,7 @@ function CodeForm(props: { relay: Relay; label: string; onPaired: () => void }) 
     if (message.type !== "relay.result" || !pending()) return
     setPending(false)
     if (message.status === "connected") props.onPaired()
-    if (message.status === "invalid-code") return setNote("That isn't a pairing code. Enter the 8 characters `browse pair` prints (XXXX-XXXX).")
+    if (message.status === "invalid-code") return setNote("Enter the eight characters shown in Desktop. The hyphen is optional.")
     setCode("")
     const address = message.address ?? ""
     setNote(message.status === "connecting" ? `The relay ${address.startsWith("localhost:") ? "on this computer" : `at ${address}`} hasn't answered yet. This updates when it does.` : undefined)
@@ -484,22 +417,31 @@ function CodeForm(props: { relay: Relay; label: string; onPaired: () => void }) 
       class="code-form"
       onSubmit={(event) => {
         event.preventDefault()
-        if (!code().trim()) return
+        if (pending() || !code().trim()) return
         setPending(true)
         setNote(undefined)
         props.relay.send({ type: "relay.connect", address: props.relay.state()?.relay.address ?? "", code: code() })
       }}
     >
-      <p class="hint">
-        <Rich text={props.label} />
-      </p>
+      <label for="pairing-code" class="step-title">Pairing code</label>
       <div class="inline-form">
-        <TextInput value={code()} onInput={(event) => setCode(event.currentTarget.value)} placeholder="XXXX-XXXX" aria-label="Pairing code" autocomplete="off" spellcheck={false} />
-        <Button type="submit" variant="contrast" disabled={pending()}>
+        <TextInput
+          id="pairing-code"
+          value={code()}
+          onInput={(event) => setCode(event.currentTarget.value)}
+          placeholder="XXXX-XXXX"
+          autocomplete="off"
+          autocapitalize="characters"
+          spellcheck={false}
+          appearance="large"
+        />
+        <Button type="submit" variant="contrast" size="large" disabled={pending() || !code().trim()}>
           {pending() ? "Pairing…" : "Pair"}
         </Button>
       </div>
-      <Show when={note()}>{(text) => <Note tone="warn"><Rich text={text()} /></Note>}</Show>
+      <Show when={note()}>
+        {(text) => <div role="status"><Note tone="warn">{text()}</Note></div>}
+      </Show>
     </form>
   )
 }

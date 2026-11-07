@@ -1,8 +1,7 @@
-/* The onboarding guide, after Console's Connect OpenCode card (opencode-console features/onboarding). */
 .page {
   --hair: 0.5px;
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
-  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --pairing-link: #9c3d16;
   max-width: 720px;
   margin: 0 auto;
   padding: 32px 24px 64px;
@@ -11,10 +10,14 @@
   letter-spacing: -0.04px;
 }
 
+[data-color-scheme="dark"] .page {
+  --pairing-link: #ff9a6e;
+}
+
 .guide {
   margin-top: 24px;
   border: 0.5px solid var(--v2-border-border-muted);
-  border-radius: 6px;
+  border-radius: 10px;
   background: var(--v2-background-bg-layer-01);
   overflow: hidden;
 }
@@ -26,22 +29,22 @@
 .guide-head {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 16px;
+  gap: 6px;
+  padding: 24px;
 }
 
 .guide-title {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  font-size: 15px;
-  line-height: 20px;
-  font-weight: 530;
-  letter-spacing: 0;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 24px;
+  line-height: 30px;
+  font-weight: 600;
+  letter-spacing: -0.45px;
 }
 
-.guide-sub,
-.muted {
+.guide-sub {
   color: var(--v2-text-text-muted);
 }
 
@@ -49,6 +52,9 @@
 .guide-connected {
   display: inline-flex;
   gap: 6px;
+  font-size: 13px;
+  line-height: 20px;
+  letter-spacing: 0;
   transition:
     opacity 250ms var(--ease-out),
     transform 250ms var(--ease-out);
@@ -60,66 +66,6 @@
 
 .guide-connected .ok {
   color: var(--v2-state-fg-success);
-}
-
-.tabs {
-  position: relative;
-  display: flex;
-  gap: 2px;
-  height: 48px;
-  padding: 0 16px 0 5px;
-  align-items: stretch;
-}
-
-.tab {
-  position: relative;
-  display: flex;
-  align-items: center;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--v2-text-text-faint);
-  font-weight: 530;
-  line-height: 13px;
-  transition: color 150ms ease;
-}
-
-.tab > span {
-  display: inline-flex;
-  align-items: center;
-  height: 28px;
-  padding: 0 11px;
-  border-radius: 6px;
-  transition: background-color 150ms ease;
-}
-
-.tab[data-selected] {
-  color: var(--v2-text-text-base);
-}
-
-.tab:focus-visible {
-  outline: none;
-}
-
-.tab:focus-visible > span {
-  outline: 2px solid var(--v2-border-border-focus);
-}
-
-.tab-indicator {
-  position: absolute;
-  left: 0;
-  bottom: 0;
-  height: 1px;
-  background: linear-gradient(
-    to right,
-    transparent 11px,
-    var(--v2-border-border-inverse) 11px,
-    var(--v2-border-border-inverse) calc(100% - 11px),
-    transparent calc(100% - 11px)
-  );
-  transition:
-    transform 250ms var(--ease-in-out),
-    width 250ms var(--ease-in-out);
 }
 
 .guide-body {
@@ -227,7 +173,7 @@
   vertical-align: middle;
 }
 
-/* Command field: [picker ▾ | command  ⧉] */
+/* Copyable command or prompt. */
 .cmd {
   display: inline-flex;
   align-self: flex-start;
@@ -240,35 +186,6 @@
   overflow: hidden;
 }
 
-.cmd-menu {
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  gap: 4px;
-  padding: 0 8px 0 12px;
-  border: 0;
-  background: transparent;
-  color: var(--v2-text-text-muted);
-  font-weight: 530;
-  white-space: nowrap;
-  transition: background-color 150ms ease;
-}
-
-.cmd-menu[aria-expanded="true"] {
-  background: var(--v2-overlay-simple-overlay-hover);
-}
-
-.cmd-menu:focus-visible {
-  outline: 2px solid var(--v2-border-border-focus);
-  outline-offset: -3px;
-}
-
-.cmd-sep {
-  flex: none;
-  width: var(--hair);
-  background: var(--v2-border-border-strong);
-}
-
 .cmd-text {
   display: inline-flex;
   flex: 1 1 auto;
@@ -278,7 +195,7 @@
   padding: 4px 4px 4px 12px;
 }
 
-/* One line, whatever the command is: the code area scrolls instead of wrapping, so the picker and copy button stay put. */
+/* One line, whatever the command is: the code area scrolls instead of wrapping, so the copy button stays put. */
 .cmd-text code {
   flex: 1 1 auto;
   min-width: 0;
@@ -303,22 +220,18 @@
   background: var(--v2-border-border-strong);
 }
 
-@media (hover: hover) and (pointer: fine) {
-  .tab:hover {
-    color: var(--v2-text-text-base);
-  }
-  .tab:hover > span,
-  .cmd-menu:hover {
-    background: var(--v2-overlay-simple-overlay-hover);
-  }
-}
-
 .guide .link {
   border: 0;
   background: none;
   padding: 0;
   font: inherit;
+  font-weight: 530;
+  color: var(--pairing-link);
   cursor: pointer;
+}
+
+.guide .link:hover {
+  text-decoration: underline;
 }
 
 .waiting {
@@ -349,12 +262,24 @@
   .pulse {
     animation: none;
   }
+
+  .guide-connected,
+  .num {
+    transition: none;
+  }
 }
 
 .code-form {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  max-width: 320px;
+}
+
+.code-form input {
+  font-family: var(--font-family-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .guide-foot {
@@ -362,27 +287,21 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 16px;
-  padding: 16px;
-}
-
-.sep {
-  flex: none;
-  width: 1px;
-  height: 12px;
-  background: var(--v2-border-border-strong);
+  padding: 16px 24px;
 }
 
 @media (max-width: 520px) {
   .page {
     padding: 20px 12px 48px;
   }
+  .guide-head,
   .guide-body {
-    padding: 24px 16px;
+    padding: 20px 16px;
   }
   .step {
     gap: 14px;
   }
-  .guide-foot .sep {
-    display: none;
+  .guide-foot {
+    padding-inline: 16px;
   }
 }
