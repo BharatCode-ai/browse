@@ -130,4 +130,3 @@ export const runCommand: Run = (command, args, options = {}) =>
       resolve({ status, stdout, stderr })
     })
   })
-
