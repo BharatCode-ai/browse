@@ -51,7 +51,7 @@ export const BROWSER_NAME_KEY = "browserName"
 export const RELAY_ADDRESS_KEY = "agentRelayAddress"
 export type RelayAddress = { host: string; port?: number }
 /**
- * A typed or stored relay address (`100.64.0.2`, `devbox.tailnet.ts.net:19988`, `[fd7a::1]`, an optional `ws://`), or
+ * A typed or stored relay address (`100.64.0.2`, `devbox.tailnet.ts.net:19989`, `[fd7a::1]`, an optional `ws://`), or
  * undefined when it isn't one. Empty means this computer: `{ host: "127.0.0.1" }`.
  */
 export function relayAddress(input: unknown): RelayAddress | undefined {

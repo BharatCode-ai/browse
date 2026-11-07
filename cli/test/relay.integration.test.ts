@@ -160,6 +160,18 @@ describe("relay", () => {
     } finally { pair.kill() }
   }, 12_000)
 
+  test("Desktop can mint a one-time pairing code without waiting for the extension", async () => {
+    const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "../src/main.ts"), "pair", "--code-only"], {
+      env: { PATH: process.env.PATH, HOME: home, OPENCODE_BROWSER_HOME: home, OPENCODE_BROWSER_PORT: String(port) },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await child.exited).toBe(0)
+    const code = (await new Response(child.stdout).text()).trim()
+    expect(code).toMatch(/^[0-9A-Z]{4}-[0-9A-Z]{4}$/)
+    expect((await pairWithCode(port, code.replace("-", ""), "desktop-browser")).open).toBe(true)
+  })
+
   test("an expired code is refused", async () => {
     const expired = await pairWithCode(port, mintPairingCode(home, { now: Date.now() - 11 * 60_000 }), "late")
     expect(expired.token).toBeUndefined()

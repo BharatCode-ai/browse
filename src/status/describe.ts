@@ -11,7 +11,7 @@ export function relayResultText(result: RelayResult["status"], address: string, 
   const local = address.startsWith("localhost:")
   const at = local ? `on this computer (${address})` : `at ${address}`
   return {
-    "invalid-address": "That isn't an address. Use localhost, or a host or IP with an optional port: 100.64.0.2 or devbox.tailnet.ts.net:19988.",
+    "invalid-address": "That isn't an address. Use localhost, or a host or IP with an optional port: 100.64.0.2 or devbox.tailnet.ts.net:19989.",
     "invalid-code": "That isn't a pairing code. Enter the 8 characters `browse pair` prints on the relay's computer (XXXX-XXXX).",
     connected: `Connected to the relay ${at}.`,
     connecting: `The relay ${at} hasn't answered yet. This updates when it does.`,

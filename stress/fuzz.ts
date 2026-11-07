@@ -204,11 +204,11 @@ async function fuzzCdp(token: string) {
 
 async function fuzzExtensionEndpoint() {
   stats.extension++
-  const origin = pick(["chrome-extension://afeafocngkodbmaipcngoamamfmekgfo", "chrome-extension://mfnicocicmmlkpjnaffgihfjhdgjkdjg", "chrome-extension://evilevilevilevilevilevilevilevil", "https://evil.example", ""])
+  const origin = pick(["chrome-extension://faccoaejfgiiagkhdlhikildfefmjigf", "chrome-extension://mfnicocicmmlkpjnaffgihfjhdgjkdjg", "chrome-extension://evilevilevilevilevilevilevilevil", "https://evil.example", ""])
   const ws = await openWs(`ws://127.0.0.1:${relayPort}/extension`, origin ? { origin } : {})
   // The checkout's unpacked id and the public store item (cli/src/paths.ts PUBLIC_STORE_ID, always allowed by relay.ts)
   // may reach the pairing handshake; any other origin must be refused at the upgrade.
-  const allowed = origin.includes("afeafocngkodbmaipcngoamamfmekgfo") || origin.includes("mfnicocicmmlkpjnaffgihfjhdgjkdjg")
+  const allowed = origin.includes("faccoaejfgiiagkhdlhikildfefmjigf") || origin.includes("mfnicocicmmlkpjnaffgihfjhdgjkdjg")
   if (typeof ws === "string") {
     if (allowed) log.write({ note: "extension-endpoint refused allowed origin", origin, result: ws })
     return

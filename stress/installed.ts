@@ -32,7 +32,7 @@ const { values } = parseArgs({
     "drop-seconds": { type: "string", default: "60" },
     agents: { type: "string", default: "16" },
     keep: { type: "boolean", default: false },
-    port: { type: "string", default: "19988" },
+    port: { type: "string", default: "19989" },
     "debug-port": { type: "string", default: "9222" },
   },
 })
@@ -118,7 +118,7 @@ const scenarios: Scenario[] = [
       const t = Date.now()
       try {
         // Install's link reaches the default port; another port is what the user types on the settings page.
-        if (ctx.u.port === 19988) await pairViaLink(cdp, code)
+        if (ctx.u.port === 19989) await pairViaLink(cdp, code)
         else await pairViaSettings(cdp, code, `localhost:${ctx.u.port}`)
         const paired = await waitFor(() => extensionConnected(ctx.u), { timeoutMs: 60_000, label: "extension connected after the pairing link" })
         const after = status(ctx.u)

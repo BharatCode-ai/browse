@@ -17,7 +17,7 @@ import { manifestVersionFields } from "./version.ts"
 
 const root = path.resolve(import.meta.dir, "..")
 export const PACKAGE_NAME = "@opencode/browse"
-const DEFAULT_RELAY_PORT = "19988"
+const DEFAULT_RELAY_PORT = "19989"
 
 /** Strings that only development or test builds contain. */
 const TEST_ONLY_MARKERS = [

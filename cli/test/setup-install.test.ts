@@ -245,7 +245,7 @@ describe("install with the extension", () => {
   })
 
   test("an installed extension is ready even before the relay runs", () => {
-    const match = { browser: chrome, profile: { dir: "Default", name: "Person 1" }, id: "afeafocngkodbmaipcngoamamfmekgfo" }
+    const match = { browser: chrome, profile: { dir: "Default", name: "Person 1" }, id: "faccoaejfgiiagkhdlhikildfefmjigf" }
     const { outcome, output } = run({ detections: [{ ...none(chrome), enabled: [match] }] })
     expect(outcome).toBe("ready")
     expect(output).toBe("")
@@ -260,7 +260,7 @@ describe("install with the extension", () => {
   })
 
   test("a turned-off extension is reported, not reinstalled", () => {
-    const match = { browser: chrome, profile: { dir: "Default", name: "Person 1" }, id: "afeafocngkodbmaipcngoamamfmekgfo" }
+    const match = { browser: chrome, profile: { dir: "Default", name: "Person 1" }, id: "faccoaejfgiiagkhdlhikildfefmjigf" }
     const { outcome, calls, output } = run({ detections: [{ ...none(chrome), disabled: [match] }] })
     expect(outcome).toBe("off")
     expect(calls.open).toEqual([])
@@ -325,7 +325,7 @@ describe("pairing the store build", () => {
   })
 
   test("never hands the code to an extension that isn't a configured store item", () => {
-    const { outcome, opened } = pair([{ ...none(chrome), enabled: [{ browser: chrome, profile, id: "afeafocngkodbmaipcngoamamfmekgfo" }] }])
+    const { outcome, opened } = pair([{ ...none(chrome), enabled: [{ browser: chrome, profile, id: "faccoaejfgiiagkhdlhikildfefmjigf" }] }])
     expect(outcome).toBe("none")
     expect(opened).toEqual([])
   })
@@ -424,7 +424,7 @@ test("install --remote prefers the tailnet's addresses, else the LAN's, and prin
   const address = (value: string, internal = false) => ({ address: value, family: "IPv4" as const, internal, netmask: "255.255.255.0", mac: "00:00:00:00:00:00", cidr: null })
   const lan = { lo: [address("127.0.0.1", true)], eth0: [address("192.168.1.20")], docker0: [address("172.17.0.1")], wlan0: [address("169.254.3.4"), address("10.0.0.5")] }
   expect(remoteRelayAddresses(lan)).toEqual(["192.168.1.20", "10.0.0.5"])
-  expect(remoteRelayAddresses(lan, { port: 19988 })).toEqual(["192.168.1.20", "10.0.0.5"])
+  expect(remoteRelayAddresses(lan, { port: 19989 })).toEqual(["192.168.1.20", "10.0.0.5"])
   expect(remoteRelayAddresses(lan, { port: 20001 })).toEqual(["192.168.1.20:20001", "10.0.0.5:20001"])
   const tailnet = { ...lan, tailscale0: [address("100.101.102.103")] }
   expect(remoteRelayAddresses(tailnet)).toEqual(["100.101.102.103"])

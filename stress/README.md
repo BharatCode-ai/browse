@@ -13,7 +13,7 @@ whose browser or relay someone uses.
 - `~/browse`: a clone of this repo, built and paired with `bun run setup`.
 - systemd units (`exe/units/`): `browse-xvfb` (display `:99`), `browse-wm`, `browse-chrome` (headed Chrome with the
   extension, restarted on crash), `browse-vnc` (localhost only) and `browse-novnc` (port 8000).
-- The relay is not a service: like on a laptop, any CLI or MCP call starts it on `127.0.0.1:19988`.
+- The relay is not a service: like on a laptop, any CLI or MCP call starts it on `127.0.0.1:19989`.
 
 Chrome's flags are in `exe/chrome.sh`. The profile is `~/stress-profile` with developer mode on (browse's
 `install`/`update` reload the extension, and Chrome disables reloaded unpacked extensions while developer mode is
@@ -39,7 +39,7 @@ pairing code.
 `bash stress/exe/provision.sh --canary-only` adds the release lane to a provisioned box without rebuilding its checkout
 or restarting `browse-chrome`. User `canary` installs the published dev binary via the real Bash installer. Its headed
 Chrome for Testing uses the installer's checksum-verified dev zip, a private Xvfb and relay `:19770`; the kernel blocks
-that user's access to `:19988`. Every ~5 min the daemon checks npm. It observes the live relay **and loaded extension**
+that user's access to `:19989`. Every ~5 min the daemon checks npm. It observes the live relay **and loaded extension**
 switching, allows an idle update window, and flags and forces `browse update` after an hour. Each build gets core
 scenarios and 30 min of chaos. At ~03:00 local time (or next idle slot) it runs 60 min of all chaos, 15 min of fuzz,
 an npx MCP smoke, then 30 min of two-browser affinity checks if Brave installed. Network faults affect only `canary`;
@@ -110,7 +110,7 @@ long browse took to work again and whether the user had to do anything:
 stress/exe/installed-setup.sh curl            # curl installer into ~/u/home-curl
 stress/exe/installed-setup.sh curl 0.0.6 old  # a pinned version into ~/u/home-curl-old
 stress/exe/installed-setup.sh npm             # npm installer into ~/u/home-npm
-node stress/installed.ts [--user curl] [--port 19988] [--debug-port 9222] [--extension ~/u/ext-0.0.8-store] [--only a,b]
+node stress/installed.ts [--user curl] [--port 19989] [--debug-port 9222] [--extension ~/u/ext-0.0.8-store] [--only a,b]
 ```
 
 The extension folders under `~/u/ext-*` are the release zips with the store's public key added to `manifest.json`, so

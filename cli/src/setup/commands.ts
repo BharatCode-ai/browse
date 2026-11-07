@@ -55,7 +55,7 @@ export type ExtensionStatus = {
   protocolVersion?: number | null
 }
 
-export const relayBase = () => `http://127.0.0.1:${Number(process.env.OPENCODE_BROWSER_PORT) || 19988}`
+export const relayBase = () => `http://127.0.0.1:${Number(process.env.OPENCODE_BROWSER_PORT) || 19989}`
 
 /** The relay token header; the relay rejects every API request without it. */
 const relayHeaders = (): Record<string, string> => {
@@ -176,10 +176,14 @@ export async function extension() {
 /** `pair`: a new one-time code. `pair --list`: the paired browsers. `pair --revoke <browser>`: unpair one. */
 export async function pair(args: string[]) {
   mkdirSync(files.dir, { recursive: true })
+  if (args.length === 1 && args[0] === "--code-only") {
+    ensureRelay(runningEntry())
+    return log(formatPairingCode(mintPairingCode()))
+  }
   if (args[0] === "--list") return listPairings()
   if (args[0] === "--revoke") return revokePairing(args[1])
   if (args.length && !(args.length === 2 && args[0] === "--wait-seconds")) {
-    log(`Usage: ${cliCommand("pair")} [--wait-seconds <seconds> | --list | --revoke <browser>]`)
+    log(`Usage: ${cliCommand("pair")} [--wait-seconds <seconds> | --code-only | --list | --revoke <browser>]`)
     process.exitCode = 1
     return
   }

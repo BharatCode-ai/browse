@@ -75,6 +75,7 @@ if (command === "--version" || command === "-v") {
                                  install, or the store page)
   pair [--wait-seconds <seconds>] Start the relay, print a one-time code (valid 10 minutes) and wait for the
                                  browser that redeems it (default 180 seconds)
+    --code-only                  Start the relay and print a fresh code without waiting
     --list                       Show paired browsers: id, name, profile, when paired and last seen
     --revoke <browser>           Unpair a browser (its id, name or profile) and disconnect it;
                                  \`--revoke legacy\` retires the shared code of earlier versions

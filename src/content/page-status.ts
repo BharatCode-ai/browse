@@ -238,12 +238,12 @@ function create() {
   root = host.attachShadow({ mode: "closed" })
   root.innerHTML = `<style>${STYLE}</style>
     <div id="card" role="dialog" aria-labelledby="title" aria-describedby="message">
-      <div id="head"><span id="dot"></span><span id="title">Your turn</span><span id="source">${MARK}browse</span></div>
+      <div id="head"><span id="dot"></span><span id="title">Your turn</span><span id="source">BharatCode Browse</span></div>
       <p id="origin"></p>
       <p id="message"></p>
       <div id="actions"><button id="continue" type="button">Continue</button></div>
     </div>
-    <div id="pill" role="status" aria-live="polite">${MARK}<span id="label"></span><span id="light"></span></div>`
+    <div id="pill" role="status" aria-live="polite"><span id="label"></span><span id="light"></span></div>`
   root.getElementById("continue")!.addEventListener("click", (event) => {
     // Page scripts can't reach the closed root, and only the user's own click counts.
     if (!event.isTrusted) return
@@ -280,7 +280,6 @@ function clear() {
   removeHost()
 }
 
-const MARK = `<svg class="mark" viewBox="0 0 16 20" width="9" height="11" aria-hidden="true"><path d="M12 16H4V8h8v8Z" fill="currentColor" opacity=".45"/><path d="M12 4H4v12h8V4Zm4 16H0V0h16v20Z" fill="currentColor"/></svg>`
 
 // Colors follow the color scheme preference; the page itself may be light or dark either way, so both
 // surfaces are opaque enough to read on anything. Fonts are system fonts only: a page's own @font-face

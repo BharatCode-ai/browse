@@ -27,7 +27,7 @@ export {
 
 export const defaultHost = "127.0.0.1"
 /** Not Browser Control's 19989, so an old relay can't hold browse's port. Keep in step with the extension. */
-export const defaultPort = 19988
+export const defaultPort = 19989
 
 const RawTargetSelection = Schema.Struct({
   urlIncludes: Schema.optionalKey(Schema.String),

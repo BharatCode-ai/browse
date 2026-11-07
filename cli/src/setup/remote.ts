@@ -29,7 +29,7 @@ export function remoteRelayAddresses(
     .map((address) => address.address)
   const tailnet = ipv4.filter((address) => tailnetIPv4.test(address))
   const hosts = tailnet.length ? [...(options.magicDns ? [options.magicDns] : []), ...tailnet] : ipv4
-  const port = options.port && options.port !== 19988 ? `:${options.port}` : ""
+  const port = options.port && options.port !== 19989 ? `:${options.port}` : ""
   return [...new Set(hosts)].map((host) => host + port)
 }
 
@@ -76,7 +76,7 @@ export async function installRemote(entry: string, tty: boolean) {
     } else log("✓ Opened the relay to other computers")
   } else log("✓ The relay is open to other computers")
   ensureRelay(entry)
-  const port = Number(process.env.OPENCODE_BROWSER_PORT) || 19988
+  const port = Number(process.env.OPENCODE_BROWSER_PORT) || 19989
   const interfaces = networkInterfaces()
   const onTailnet = Object.values(interfaces)
     .flat()

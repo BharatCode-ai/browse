@@ -65,12 +65,12 @@ describe("relay token", () => {
 
 describe("Host, Origin and Sec-Fetch-Site checks", () => {
   test("accept loopback hosts on the relay's port only", () => {
-    for (const hostHeader of ["127.0.0.1:19988", "localhost:19988", "[::1]:19988", "127.0.0.1"]) {
-      expect(validateHostHeader({ hostHeader, host: "127.0.0.1", port: 19988 })).toBeUndefined()
+    for (const hostHeader of ["127.0.0.1:19989", "localhost:19989", "[::1]:19989", "127.0.0.1"]) {
+      expect(validateHostHeader({ hostHeader, host: "127.0.0.1", port: 19989 })).toBeUndefined()
     }
-    expect(validateHostHeader({ hostHeader: "127.0.0.1:1234", host: "127.0.0.1", port: 19988 })).toBe("Invalid Host header port")
-    expect(validateHostHeader({ hostHeader: "evil.test:19988", host: "127.0.0.1", port: 19988 })).toBe("Invalid Host header")
-    expect(validateHostHeader({ hostHeader: undefined, host: "127.0.0.1", port: 19988 })).toBe("Invalid Host header")
+    expect(validateHostHeader({ hostHeader: "127.0.0.1:1234", host: "127.0.0.1", port: 19989 })).toBe("Invalid Host header port")
+    expect(validateHostHeader({ hostHeader: "evil.test:19989", host: "127.0.0.1", port: 19989 })).toBe("Invalid Host header")
+    expect(validateHostHeader({ hostHeader: undefined, host: "127.0.0.1", port: 19989 })).toBe("Invalid Host header")
   })
 
   test("refuse cross-site browser requests", () => {
@@ -163,7 +163,7 @@ describe("browser tokens", () => {
 
 describe("code exchange", () => {
   test("the extension and the relay agree on the session key, and the token unmasks only with it", async () => {
-    const port = 19988
+    const port = 19989
     const code = mintPairingCode(fs.mkdtempSync(path.join(home, "exchange-")))
     const extensionKeys = await ExtensionPairing.ecdhKeyPair()
     const relay = ecdhExchange(extensionKeys.publicKey)!
@@ -192,7 +192,7 @@ describe("token handshake", () => {
   const code = issueBrowserToken("test", home)
   const relayNonce = ExtensionPairing.randomNonce()
   const extensionNonce = ExtensionPairing.randomNonce()
-  const port = 19988
+  const port = 19989
 
   test("the extension accepts the relay's proof, and the relay the extension's", async () => {
     // Relay → extension: the relay proves it knows the code over both nonces.
@@ -218,11 +218,11 @@ describe("token handshake", () => {
   test("a proof made for another relay port is refused", async () => {
     // A listener on another port that passes the handshake through to this relay: the extension proves for the port
     // it dialled, the relay checks against its own.
-    const forwardedExtensionProof = await ExtensionPairing.pairingProof(code, "extension", 19989, extensionNonce, relayNonce)
+    const forwardedExtensionProof = await ExtensionPairing.pairingProof(code, "extension", port + 1, extensionNonce, relayNonce)
     expect(secretsEqual(pairingProof(code, "extension", port, extensionNonce, relayNonce), forwardedExtensionProof)).toBe(false)
     const forwardedRelayProof = pairingProof(code, "relay", port, relayNonce, extensionNonce)
-    expect(ExtensionPairing.sameSecret(await ExtensionPairing.pairingProof(code, "relay", 19989, relayNonce, extensionNonce), forwardedRelayProof)).toBe(false)
-    expect(ExtensionPairing.pairingEndpoint(port)).toBe("127.0.0.1:19988/extension")
+    expect(ExtensionPairing.sameSecret(await ExtensionPairing.pairingProof(code, "relay", port + 1, relayNonce, extensionNonce), forwardedRelayProof)).toBe(false)
+    expect(ExtensionPairing.pairingEndpoint(port)).toBe("127.0.0.1:19989/extension")
   })
 
   test("install writes a one-time code into an unpacked extension folder", () => {

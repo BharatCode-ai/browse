@@ -7,7 +7,7 @@ type JsonValue = JsonPrimitive | JsonValue[] | { readonly [key: string]: JsonVal
 export type JsonObject = { readonly [key: string]: JsonValue }
 
 /** The relay's default port (cli/src/relay-helpers.ts defaultPort). */
-export const defaultRelayPort = 19988
+export const defaultRelayPort = 19989
 
 /**
  * Chrome's minimum alarm period. A disconnected extension's MV3 worker sleeps until this alarm fires, so the

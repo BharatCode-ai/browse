@@ -4,7 +4,7 @@
 #   installed-setup.sh npm              # npx @opencode/browse@latest install
 #   installed-setup.sh extensions       # the release zips with the store's manifest key (so their id is the store id)
 # Each install runs non-interactively (as an agent would run it) with --no-wait: pairing is the harness's job.
-# The relay it starts listens on OPENCODE_BROWSER_PORT (default 19988): stop the other user's relay first, or set a port.
+# The relay it starts listens on OPENCODE_BROWSER_PORT (default 19989): stop the other user's relay first, or set a port.
 set -euo pipefail
 export PATH=/usr/local/bin:$PATH
 kind="${1:?curl|npm|extensions}"

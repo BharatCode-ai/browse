@@ -73,10 +73,19 @@ p code,
   gap: 8px;
 }
 
+.brand img {
+  border-radius: 5px;
+}
+
 .brand-name {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: -0.2px;
+  color: #9c3d16;
+}
+
+[data-color-scheme="dark"] .brand-name {
+  color: #ff9a6e;
 }
 
 .brand-page {

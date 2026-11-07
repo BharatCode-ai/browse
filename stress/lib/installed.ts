@@ -18,7 +18,7 @@ export const DISPLAY = process.env.DISPLAY ?? ":99"
 export type User = {
   readonly name: string
   readonly home: string
-  /** The relay's port for this install (OPENCODE_BROWSER_PORT; 19988 by default). */
+  /** The relay's port for this install (OPENCODE_BROWSER_PORT; 19989 by default). */
   readonly port: number
   /** Chrome's --remote-debugging-port for this user's browser (harness only). */
   readonly debugPort: number
@@ -38,7 +38,7 @@ export function user(name: string, options: { port?: number; debugPort?: number;
   return {
     name,
     home,
-    port: options.port ?? 19988,
+    port: options.port ?? 19989,
     debugPort: options.debugPort ?? 9222,
     binary: options.binary ?? binary,
     configDir: path.join(home, ".config/browse"),

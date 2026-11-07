@@ -15,7 +15,7 @@ table inet browse_canary {
   set offline { type uid; flags timeout; }
   chain output {
     type filter hook output priority filter; policy accept;
-    meta skuid $uid oifname "lo" tcp dport 19988 reject
+    meta skuid $uid oifname "lo" tcp dport 19989 reject
     meta skuid @offline tcp dport { 53, 80, 443 } drop
     meta skuid @offline udp dport { 53, 443 } drop
   }

@@ -3,7 +3,7 @@
 // worker, and read ground truth (tabs, groups, debugger attachments) from the extension itself.
 import { chromeDebugPort, sleep } from "./env.ts"
 
-export const EXTENSION_ID = "afeafocngkodbmaipcngoamamfmekgfo"
+export const EXTENSION_ID = "faccoaejfgiiagkhdlhikildfefmjigf"
 
 type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
 

@@ -33,8 +33,8 @@ except Exception:
 prefs.setdefault("extensions", {}).setdefault("ui", {})["developer_mode"] = True
 if os.environ.get("BROWSE_CANARY_SHORTCUT") == "1":
     prefs["extensions"].setdefault("commands", {})["linux:Ctrl+Shift+Y"] = {
-        "extension": "afeafocngkodbmaipcngoamamfmekgfo", "command_name": "_execute_action", "global": False}
-ext = prefs["extensions"].get("settings", {}).get("afeafocngkodbmaipcngoamamfmekgfo")
+        "extension": "faccoaejfgiiagkhdlhikildfefmjigf", "command_name": "_execute_action", "global": False}
+ext = prefs["extensions"].get("settings", {}).get("faccoaejfgiiagkhdlhikildfefmjigf")
 if ext:
     ext.pop("disable_reasons", None)
     ext["state"] = 1

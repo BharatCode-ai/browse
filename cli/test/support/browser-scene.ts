@@ -105,7 +105,7 @@ export async function startBrowserScene<T = undefined>(options: StartBrowserScen
   for (const entry of fs.readdirSync(extension, { recursive: true })) {
     const file = path.join(extension, String(entry))
     if (/\.(js|json)$/.test(file) && fs.statSync(file).isFile()) {
-      fs.writeFileSync(file, fs.readFileSync(file, "utf8").replaceAll("19988", String(port)))
+      fs.writeFileSync(file, fs.readFileSync(file, "utf8").replaceAll("19989", String(port)))
     }
   }
   const cli = path.join(runtime, "dist/cli.mjs")

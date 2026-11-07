@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "browse",
-  "description": "Lets your AI agents use your browser: drive tabs, run Playwright, take screenshots, and hand off to you.",
+  "name": "BharatCode Browse",
+  "description": "Connect your browser to BharatCode Desktop so your agent can work in tabs you share.",
   "version": "0.0.14",
   "minimum_chrome_version": "125",
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjWdgsBDUPCHO2u5bq3/Us1sLm+kiehLZBL0HIu3stwivGW+bgCDsD8KAEMFJcY04u3iudffTeEGdEe8pQfL7BSNRvyslszmvJrsoP7bVUKXrnRTw3CUsRjnwbqMoMElwegiCFUXPnqQ9ZeA2NGEhmWMyDXqqZxOo0z2q66GTgz9McbXOBK2QXYBPjUWxud814wSrE1lIQ2G58nQVeZenI3/PXZ4f1SACn6SdkiCR44NZwz89I1ISxftongLDED/1dlnivqJBzAtN1s2i+jWplLtOmLJJkh1LQ2jP3gWvYY1zT2RHJIw874SSrrhFt4Hguvo/L0Ge7ixvGp5tDAP2wwIDAQAB",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxOXRcP2AdNO/I+du+mroADW815t3JWGnevJfm9LCBJmqiSNNYtShJMpHQ88CfRft3351eagb6lvB86ecQ92iVvVYIoY4M1H6HYvFdgHAVus4uruoye+kyBUAv9ZHYZf3ZnjVDC3B7TmcA2hfptRPLZF2GrOvCSKEDqoMSVKptmpSSYoSHIgLiM3vm+GJKqvhagM5Yqq3ykm6GgXUZKA6ONU6QInQbayoySgQ0WtCCdYWvQbqkEMeg2xkCTQeM/CEbvdIWtkdNBVqrJ4DKXtN9pwwcfjraiYfOH1NenKFFVfin8kuqVrsqnStXG83RWq1i/xIzZF2ByD6NjeHec5JPwIDAQAB",
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
@@ -12,7 +12,7 @@
     "128": "icons/icon-128.png"
   },
   "action": {
-    "default_title": "browse · Click to let agents use this tab",
+    "default_title": "BharatCode Browse \u00b7 Click to share this tab with your agent",
     "default_icon": {
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png"

@@ -14,7 +14,7 @@ export const stateDir = xdg("XDG_STATE_HOME", ".local/state")
 export const cacheDir = xdg("XDG_CACHE_HOME", ".cache")
 export const binDir = process.env.XDG_BIN_HOME ?? path.join(home, ".local", "bin")
 export const binaryPath = path.join(binDir, "browse")
-export const relayPort = Number(process.env.OPENCODE_BROWSER_PORT) || 19988
+export const relayPort = Number(process.env.OPENCODE_BROWSER_PORT) || 19989
 export const relayBase = `http://127.0.0.1:${relayPort}`
 /** Chrome's --remote-debugging-port, used only by the harness (handoff clicks, SW stops, ground-truth tab counts). */
 export const chromeDebugPort = Number(process.env.BROWSE_STRESS_CHROME_PORT) || 9222

@@ -35,7 +35,7 @@ describe("CLI contract helpers", () => {
   })
 
   test("exitCodeForError maps relay/extension unavailability to ExitCode.host (4)", () => {
-    expect(exitCodeForError(new RelayUnreachable({ message: "down", endpoint: "http://127.0.0.1:19988", path: "/version", cause: null }))).toBe(ExitCode.host)
+    expect(exitCodeForError(new RelayUnreachable({ message: "down", endpoint: "http://127.0.0.1:19989", path: "/version", cause: null }))).toBe(ExitCode.host)
     expect(exitCodeForError(new Error("boom"))).toBe(ExitCode.failure)
     expect(failure("browse status", "relay_unavailable", "down", { exitCode: ExitCode.host }).error.exitCode).toBe(4)
   })

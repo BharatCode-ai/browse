@@ -48,7 +48,7 @@ export async function runBinaryMcp(args: readonly string[]) {
     return runCli()
   }
   const REPLAY = "opencode-browser-shim-initialize"
-  const relayPort = Number(process.env.OPENCODE_BROWSER_PORT) || 19988
+  const relayPort = Number(process.env.OPENCODE_BROWSER_PORT) || 19989
   const current = versionReader(runtime, installedVersion(runtime) ?? runtime.version)
   // A stable entry path, replaced in place by the installer.
   const command = () => runtime.entry

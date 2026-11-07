@@ -14,7 +14,7 @@ export function RelayForm(props: { relay: Relay; help?: boolean; remote?: boolea
   const [pending, setPending] = createSignal(false)
   const [result, setResult] = createSignal<RelayResult>()
 
-  // The field shows where the extension connects (localhost:19988 for this computer), unless the user is editing it.
+  // The field shows where the extension connects (localhost:19989 for this computer), unless the user is editing it.
   createEffect(() => {
     const relay = props.relay.state()?.relay
     if (relay === undefined || edited()) return
@@ -54,7 +54,7 @@ export function RelayForm(props: { relay: Relay; help?: boolean; remote?: boolea
               setEdited(true)
               setAddress(event.currentTarget.value)
             }}
-            placeholder={props.remote ? "100.64.0.1 or devbox" : "localhost:19988"}
+            placeholder={props.remote ? "100.64.0.1 or devbox" : "localhost:19989"}
             autocomplete="off"
             spellcheck={false}
           />

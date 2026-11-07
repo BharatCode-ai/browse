@@ -2,18 +2,17 @@
 // One card, laid out like Console's Connect OpenCode guide: a tab for an agent on this computer and one for an agent on
 // another computer, each a few numbered steps that check themselves off from the worker's state and the first agent
 // tab.
-import { createEffect, createMemo, createSignal, For, Match, onCleanup, Show, Switch, type JSX } from "solid-js"
+import { createEffect, createMemo, createSignal, Match, onCleanup, Show, Switch, type JSX } from "solid-js"
 import { render } from "solid-js/web"
 import { Tabs } from "@kobalte/core/tabs"
 import { Button } from "@opencode/ui/button"
 import { Icon } from "@opencode/ui/icon"
 import { IconButton } from "@opencode/ui/icon-button"
-import { Menu } from "@opencode/ui/menu"
 import { TextInput } from "@opencode/ui/text-input"
 import { unpackedExtensionId, unpackedReloadAdvice } from "../../cli/src/protocol"
 import { firstRunStep, relayProbeResult, shouldProbe, type FirstRunStep, type RelayProbe } from "./first-run"
 import { TRY_PROMPT, checklist } from "./checklist"
-import { installCommand, installMethod, installMethods, remoteInstallMethod, remoteInstallMethods, type InstallMethod } from "./install"
+import { installCommand, remoteInstallCommand } from "./install"
 import { RelayForm } from "./relay-form"
 import { applyColorScheme, Brand, createFlash, createRelay, Note, Rich, type Relay } from "./ui"
 import "./onboarding.css"
@@ -26,7 +25,7 @@ const installTab = !!fragmentCode
 if (/^#(code|ticket|pair)=/.test(location.hash)) history.replaceState(null, "", location.pathname + location.search)
 
 const settingsUrl = () => chrome.runtime.getURL("settings.html")
-const AGENT_PROMPT = `Set up browse so you can use my Chrome: run ${installCommand}`
+const AGENT_PROMPT = "Use BharatCode Browse to open example.com and tell me the page title."
 
 type Where = "here" | "remote"
 type How = "agent" | "manual"
@@ -40,15 +39,11 @@ function Onboarding() {
   const [pairedBy, setPairedBy] = createSignal<"link" | "code">()
   const [linkNote, setLinkNote] = createSignal<string>()
   const [where, setWhere] = createSignal<Where>()
-  const [how, setHow] = createSignal<How>("agent")
-  const [pickedMethod, setPickedMethod] = createSignal(installMethod.id)
-  const [pickedRemoteMethod, setPickedRemoteMethod] = createSignal(remoteInstallMethod.id)
+  const [how, setHow] = createSignal<How>("manual")
 
   const step = createMemo(() => firstRunStep(relay.state(), installWaiting() ? "install-waiting" : probe()))
   const list = createMemo(() => checklist({ state: relay.state(), wasConnected: wasConnected(), tried: tried() }))
   const connected = () => list().agent === "done"
-  const method = createMemo(() => installMethods.find((option) => option.id === pickedMethod()) ?? installMethod)
-  const remoteMethod = createMemo(() => remoteInstallMethods.find((option) => option.id === pickedRemoteMethod()) ?? remoteInstallMethod)
   // Until the user picks, it follows where the extension already points.
   const remote = () => (where() ?? (relay.state()?.relay.remote ? "remote" : "here")) === "remote"
 
@@ -114,7 +109,7 @@ function Onboarding() {
       number={number}
       title="Try it"
       done={list().tryIt === "done"}
-      description={list().tryIt === "done" ? "Your agent opened a tab. browse works." : "Ask your agent something like:"}
+      description={list().tryIt === "done" ? "Your agent opened a tab. BharatCode Browse is ready." : "Ask your agent something like:"}
     >
       <Show when={list().tryIt !== "done"}>
         <Command text={TRY_PROMPT} label="Copy prompt" />
@@ -128,15 +123,15 @@ function Onboarding() {
   const installStep = (how: How) => (
     <Step
       number={1}
-      title={how === "agent" ? "Paste this into your agent" : method().title}
+      title={how === "agent" ? "Paste this into your agent" : "Connect to BharatCode Desktop"}
       done={connected()}
       description={
         connected() ? (
           <AgentDone relay={relay} pairedBy={pairedBy()} />
         ) : how === "agent" ? (
-          "OpenCode, Claude Code, Codex, Cursor or any agent that can run commands. It installs browse, adds it to itself and connects to this browser."
+          "Once your browser is connected, try this prompt in BharatCode Desktop."
         ) : (
-          "Downloads browse, adds it to the agents it finds on this computer and connects to this browser."
+          "In BharatCode Desktop, open Settings → General → Connect browser and generate a pairing code."
         )
       }
     >
@@ -148,11 +143,9 @@ function Onboarding() {
             how === "agent" ? (
               <Command text={AGENT_PROMPT} label="Copy prompt" />
             ) : (
-              <Command
-                text={method().command}
-                label="Copy command"
-                picker={<MethodMenu methods={installMethods} value={method()} onChange={(option) => setPickedMethod(option.id)} />}
-              />
+              <a class="link" href="https://github.com/arzvaak/browse#desktop-preview" target="_blank" rel="noreferrer">
+                Setup instructions
+              </a>
             )
           }
           linkNote={linkNote()}
@@ -223,20 +216,13 @@ function Onboarding() {
                 number={1}
                 title="On that computer, run"
                 done={connected()}
-                description="Installs browse there, opens its relay to other computers and prints its address and a pairing code."
+                description="Build BharatCode Browse on that computer and open the relay on a private network. Then run browse pair there."
               >
                 <Show when={!connected()}>
-                  <Command
-                    text={remoteMethod().command}
-                    label="Copy command"
-                    picker={
-                      <MethodMenu
-                        methods={remoteInstallMethods}
-                        value={remoteMethod()}
-                        onChange={(option) => setPickedRemoteMethod(option.id)}
-                      />
-                    }
-                  />
+                  <Command text={remoteInstallCommand} label="Copy command" />
+                  <a class="link" href="https://github.com/arzvaak/browse#development" target="_blank" rel="noreferrer">
+                    Source setup instructions
+                  </a>
                 </Show>
               </Step>
               <Step
@@ -334,30 +320,6 @@ function Command(props: { text: string; label: string; picker?: JSX.Element }) {
 }
 
 /** The install method picker that sits on the left of a command box. */
-function MethodMenu(props: { methods: InstallMethod[]; value: InstallMethod; onChange: (method: InstallMethod) => void }) {
-  return (
-    <Menu placement="bottom-start" gutter={4}>
-      <Menu.Trigger class="cmd-menu" aria-label="Install method">
-        {props.value.label}
-        <Icon name="chevron-down" size="small" />
-      </Menu.Trigger>
-      <Menu.Portal>
-        <Menu.Content>
-          <Menu.RadioGroup
-            value={props.value.id}
-            onChange={(id) => {
-              const picked = props.methods.find((option) => option.id === id)
-              if (picked) props.onChange(picked)
-            }}
-          >
-            <For each={props.methods}>{(method) => <Menu.RadioItem value={method.id} closeOnSelect>{method.label}</Menu.RadioItem>}</For>
-          </Menu.RadioGroup>
-        </Menu.Content>
-      </Menu.Portal>
-    </Menu>
-  )
-}
-
 function Waiting(props: { children: JSX.Element }) {
   return (
     <p class="waiting" aria-live="polite">
@@ -425,11 +387,11 @@ function AgentStep(props: {
                   : pair().reason === "refused"
                     ? `${capitalized(here(pair().remote))} refused this browser's pairing: it was unpaired there, or that relay is a new install.`
                     : `browse found ${here(pair().remote)}, but this browser isn't paired with it yet.`}{" "}
-                {pair().remote ? "" : "Run install again: it pairs by itself, or prints a code to enter below."}
+                {pair().remote ? "" : "Generate a pairing code in BharatCode Desktop."}
               </Note>
               <CodeForm
                 relay={props.relay}
-                label={pair().remote ? "Run `browse pair` on that computer and enter the code it prints:" : "Or enter the code `browse pair` prints:"}
+                label={pair().remote ? "Run `browse pair` on that computer and enter the code it prints:" : "Enter the code from BharatCode Desktop:"}
                 onPaired={props.onPaired}
               />
             </>
