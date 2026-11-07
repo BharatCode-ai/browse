@@ -13,7 +13,6 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "bun test ./test && cd cli && bun test",
     "package": "bun scripts/package.ts",
-    "release": "bun scripts/release.ts",
     "release:check": "bun scripts/release-check.ts"
   },
   "devDependencies": {

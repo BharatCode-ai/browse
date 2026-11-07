@@ -3,7 +3,7 @@ import * as RelayClient from "./relay/client.ts"
 import { relayBuildProblem } from "./relay/lifecycle.ts"
 import type { ExtensionStatus, RelayVersion, SessionSummary, TargetSummary } from "./relay/schema.ts"
 import { extensionProtocolAdvice, extensionProtocolVersion } from "./protocol.ts"
-import { binaryPackage, cacheRoot, cliCommand, compiledBinary, configRoot, dataRoot, devExtension, fromCheckout, installCommand, stateRoot } from "./paths.ts"
+import { binaryPackage, cacheRoot, cliCommand, compiledBinary, configRoot, dataRoot, fromCheckout, installCommand, stateRoot } from "./paths.ts"
 import * as SessionStore from "./session-manager/store.ts"
 import type { UpdateJson } from "./update.ts"
 import { opencodeBrowserBuildId, opencodeBrowserVersion } from "./version.ts"
@@ -547,7 +547,7 @@ function buildDoctorRecommendations(options: {
   const extensionRecommendations = options.relayResult.ok && options.extensionResult.ok && !options.extensionResult.value.connected
     ? options.extensionResult.value.nextStep ? [options.extensionResult.value.nextStep] : options.extensionResult.value.protocolCompatible === false
       ? [extensionProtocolAdvice(options.extensionResult.value.protocolVersion, { install: installCommand() })]
-      : [fromCheckout() || devExtension()
+      : [fromCheckout()
         ? `Run \`${installCommand()}\` and load the extension it points to (Load unpacked on your browser's extensions page).`
         : `Run \`${installCommand()}\`, and install browse from the Chrome Web Store page it opens.`]
     : []

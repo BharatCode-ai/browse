@@ -10,9 +10,6 @@ import {
   cacheRoot,
   configRoot as browseConfigRoot,
   dataRoot,
-  devExtension,
-  devExtensionFolder,
-  PUBLIC_STORE_ID,
   stateRoot,
   storeConfig,
   storeUrl,
@@ -23,10 +20,10 @@ import {
  * browse's public item for a checkout and a package built without one. Install hands a pairing code to the extension
  * with this ID, so it must be ours.
  */
-const storeId = storeConfig().id ?? PUBLIC_STORE_ID
-export const STORE_IDS = [storeId]
+const storeId = storeConfig().id
+export const STORE_IDS = storeId ? [storeId] : []
 /** The store page every channel installs the extension from. */
-export const STORE_URL = storeUrl(storeId)
+export const STORE_URL = storeId ? storeUrl(storeId) : undefined
 export const PACKAGE = "@opencode/browse"
 export const MCP_NAME = "browse"
 /** The MCP server's name before it was renamed to `browse`. */
@@ -75,11 +72,9 @@ export const checkoutExtensionDirs = (() => {
   return [path.join(repo, "public"), path.join(repo, "dist")]
 })()
 
-/** The dev extension a dev npm install downloads (paths.ts devExtension); undefined for a checkout or a stable release. */
-export const dev = fromSource ? undefined : devExtension()
 
 /** The folder to load unpacked: a checkout's dist/, which `bun run setup` builds, or a dev install's <cache root>/extension. */
-export const unpackedFolder = (): string | undefined => checkoutExtensionDirs[1] ?? (dev ? devExtensionFolder(paths.cache) : undefined)
+export const unpackedFolder = (): string | undefined => checkoutExtensionDirs[1]
 
 export type Settings = {
   opencode?: string

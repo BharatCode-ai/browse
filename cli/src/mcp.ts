@@ -16,7 +16,6 @@ import {
 } from "./mcp/registry.ts"
 import {
   mcpErrorMessage,
-  mcpUpdateNote,
   toolOutputJson,
   toolResult,
   toolResultForValue,
@@ -24,12 +23,10 @@ import {
 } from "./mcp/schema.ts"
 import * as RelayClient from "./relay/client.ts"
 import * as RelayLifecycle from "./relay/lifecycle.ts"
-import { createUpdateWatcher } from "./update.ts"
 import { opencodeBrowserVersion } from "./version.ts"
 
 export {
   mcpErrorMessage,
-  mcpUpdateNote,
   toolResultForValue,
 }
 
@@ -68,22 +65,6 @@ const registerTools = Effect.gen(function* () {
     id: configuredSession || shimSession() || `mcp-${crypto.randomUUID().slice(0, 8)}`,
     established: Boolean(configuredSession),
   }
-  // Checks for a newer browse in the background (cached; never delays a tool call). The first tool result after one
-  // is found carries a note for the agent to pass on, once per MCP server, i.e. once per opencode session.
-  const updates = createUpdateWatcher()
-  void updates.refresh()
-  let updateNoted = false
-  const withUpdateNote = (name: string, result: McpSchema.CallToolResult) => {
-    void updates.refresh()
-    const notice = updates.current
-    if (!notice || updateNoted) return result
-    updateNoted = true
-    if (name === "status") return result
-    return new McpSchema.CallToolResult({
-      ...result,
-      content: [...result.content, McpSchema.TextContent.make({ text: mcpUpdateNote(notice) })],
-    })
-  }
   const register = (spec: McpToolSpec) =>
     server.addTool({
       tool: new McpSchema.Tool({
@@ -116,7 +97,6 @@ const registerTools = Effect.gen(function* () {
             onSuccess: (value) =>
               spec.result ? spec.result(value) : toolResultForValue(value, spec.outputSchema ? { outputSchema: spec.outputSchema } : {}),
           }),
-          Effect.map((result) => withUpdateNote(spec.name, result)),
         )
       },
     })
@@ -127,7 +107,6 @@ const registerTools = Effect.gen(function* () {
       relay,
       currentSession,
       packageRoot,
-      update: () => updates.current,
     }),
   )
   yield* Effect.forEach(specs, register, { discard: true })

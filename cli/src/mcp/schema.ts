@@ -18,7 +18,6 @@ import {
   type TargetSelection,
 } from "../relay/schema.ts"
 import { settingKeys, type SettingKey } from "../relay/user-settings.ts"
-import type { UpdateNotice } from "../update.ts"
 
 export type CurrentSession = { id: string; established: boolean }
 
@@ -37,9 +36,6 @@ export type AdoptArguments = {
 }
 
 /** The one-time note on a tool result: what to tell the user, and that the agent may run the update itself. */
-export function mcpUpdateNote(notice: Pick<UpdateNotice, "summary" | "command">): string {
-  return `Note: browse has an update: ${notice.summary}. Tell the user they can run \`${notice.command}\` and then restart opencode, or ask you to run it for them.`
-}
 
 export function objectSchema(properties: JsonObject, required: readonly string[] = []): JsonObject {
   return {

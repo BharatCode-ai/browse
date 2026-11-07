@@ -1,8 +1,7 @@
 import { Effect } from "effect"
-import { autoUpdateStatus } from "../update/auto-update.ts"
+import { autoUpdateStatus } from "../update/local-runtime.ts"
 import { getObject } from "../relay/helpers.ts"
 import * as RelayLifecycle from "../relay/lifecycle.ts"
-import { updateJson } from "../update.ts"
 import { securityVariables, settingSpecs, type SettingReport } from "../relay/user-settings.ts"
 import { TabsCleanupResponse } from "../relay/schema.ts"
 import { registerMcpTools } from "./registry.ts"
@@ -29,14 +28,12 @@ registerMcpTools({
         Effect.gen(function* () {
           const [version, status] = yield* Effect.all([ctx.relay.version, ctx.relay.extensionStatus])
           const buildProblem = RelayLifecycle.relayBuildProblem(version)
-          const available = updateJson(ctx.update())
           return {
             endpoint: ctx.relay.endpoint,
             currentSession: ctx.currentSession.id,
             version,
             status,
             ...(buildProblem ? { buildProblem } : {}),
-            ...(available ? { update: available } : {}),
             autoUpdate: autoUpdateStatus(),
           }
         }),
@@ -99,7 +96,7 @@ registerMcpTools({
         }
         if ("autoUpdate" in changes) {
           return Effect.fail(new Error(
-            "autoUpdate can't be read or changed from MCP. The user can change it with `browse settings set autoUpdate=...` or the extension's options page; `status` reports the current value.",
+            "autoUpdate can't be read or changed from MCP. BharatCode Desktop distributes relay updates.",
           ))
         }
         return ctx.relay.settingsSet(changes).pipe(Effect.map((result) => ({ ...result, settings: agentSettings(result.settings) })))

@@ -2,8 +2,7 @@
 // every npm dependency bundled, one per platform the way opencode ships @opencode/cli-<target>:
 //   bun script/compile.ts [target...]    e.g. linux-x64 darwin-arm64 windows-x64; no target: every target
 // Output: dist-bin/browse-<target>/bin/browse (browse.exe on Windows) and its package.json (@opencode/browse-<target>,
-// with os/cpu/libc), which script/pack.ts packs for npm. Like build.ts, OPENCODE_BROWSER_STORE_ID bakes in the store
-// item and OPENCODE_BROWSER_EXTENSION_ZIP a dev build's extension zip. BUN_COMPILE_RELEASE (e.g. bun-v1.4.4) takes
+// with os/cpu/libc). OPENCODE_BROWSER_STORE_ID can pin a store listing. BUN_COMPILE_RELEASE (e.g. bun-v1.4.4) takes
 // each target's Bun runtime from that GitHub release, checked against its SHASUMS256.txt, instead of letting Bun fetch it.
 import { $ } from "bun"
 import { createHash } from "node:crypto"
@@ -47,11 +46,9 @@ if (import.meta.main) {
 
   const storeId = process.env.OPENCODE_BROWSER_STORE_ID?.trim()
   if (storeId && !/^[a-p]{32}$/.test(storeId)) throw new Error(`OPENCODE_BROWSER_STORE_ID is not a Chrome Web Store item ID: ${JSON.stringify(storeId)}`)
-  const zip = process.env.OPENCODE_BROWSER_EXTENSION_ZIP?.trim()
-  const extension = zip
-    ? await readFile(zip).then((bytes) => ({ file: path.basename(zip), sha256: createHash("sha256").update(bytes).digest("hex"), size: bytes.length }))
-    : undefined
-  const build = new Date().toISOString()
+  const sourceDate = process.env.OPENCODE_BROWSER_BUILD
+  if (sourceDate && !Number.isFinite(Date.parse(sourceDate))) throw new Error("OPENCODE_BROWSER_BUILD must be an ISO date")
+  const build = new Date(sourceDate ?? Date.now()).toISOString()
 
   await rm(outdir, { recursive: true, force: true })
   for (const item of selected) {
@@ -97,7 +94,6 @@ if (import.meta.main) {
         "globalThis.__OPENCODE_BROWSER_VERSION__": JSON.stringify(version),
         "globalThis.__OPENCODE_BROWSER_BUILD_ID__": JSON.stringify(build),
         "globalThis.__OPENCODE_BROWSER_STORE__": JSON.stringify(storeId ? { id: storeId } : {}),
-        "globalThis.__OPENCODE_BROWSER_EXTENSION__": extension ? JSON.stringify(extension) : "undefined",
         "globalThis.__OPENCODE_BROWSER_COMPILED__": "true",
         "globalThis.__OPENCODE_BROWSER_TARGET__": JSON.stringify(target),
       },

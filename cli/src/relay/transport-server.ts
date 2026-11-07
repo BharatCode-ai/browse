@@ -27,7 +27,6 @@ export interface TransportServerDeps {
   readonly authToken: string
   readonly additionalChromeExtensionOrigins: ReadonlySet<string>
   readonly isReady: () => boolean
-  readonly onAgentHttpActivity: () => void
   readonly relayRequestHandler: (request: http.IncomingMessage, response: http.ServerResponse) => void
   readonly shutdownControl: RelayShutdown
   readonly sessions: OpenCodeBrowserSessions
@@ -51,7 +50,6 @@ export function createRelayTransportServers(deps: TransportServerDeps): {
     authToken,
     additionalChromeExtensionOrigins,
     isReady,
-    onAgentHttpActivity,
     relayRequestHandler,
     shutdownControl,
     sessions,
@@ -81,10 +79,6 @@ export function createRelayTransportServers(deps: TransportServerDeps): {
       return
     }
     const started = performance.now()
-    const requestPath = (request.url ?? "").split("?")[0]
-    if (!isSilentProbePath(requestPath)) {
-      onAgentHttpActivity()
-    }
     response.once("finish", () => {
       const pathname = (request.url ?? "").split("?")[0]
       if (isSilentProbePath(pathname)) return

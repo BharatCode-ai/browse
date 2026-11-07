@@ -1,6 +1,6 @@
 import { Console, Effect, Option, Result } from "effect"
 import { Argument, Command, Flag } from "effect/cli"
-import { autoUpdateStatus } from "../update/auto-update.ts"
+import { autoUpdateStatus } from "../update/local-runtime.ts"
 import { ExitCode } from "./output.ts"
 import { createDoctorReport, formatDoctorReport, formatTargetSummary } from "../doctor.ts"
 import { cliCommand, installCommand } from "../paths.ts"
@@ -9,7 +9,6 @@ import * as RelayClient from "../relay/client.ts"
 import * as RelayLifecycle from "../relay/lifecycle.ts"
 import type { SettingsGetResponse } from "../relay/schema.ts"
 import * as SessionStore from "../session-manager/store.ts"
-import { formatUpdateNotice, updateJson, updateNotice } from "../update.ts"
 import { formatSettings, settingKeys, type SettingKey, type SettingReport } from "../relay/user-settings.ts"
 import { emitJson, ensureCliRelay, exitWith, failExit, jsonFlag, stderrLine } from "./context.ts"
 import { registerCliCommand } from "./registry.ts"
@@ -107,11 +106,7 @@ const status = Command.make(
   Effect.fn("Cli.status")(function* ({ json }) {
     const relay = yield* RelayClient.Service
     const store = yield* SessionStore.Service
-    const [relayResult, update] = yield* Effect.all(
-      [Effect.result(relay.version), Effect.promise(() => updateNotice())],
-      { concurrency: 2 },
-    )
-    const updateLine = update ? formatUpdateNotice(update) : undefined
+    const relayResult = yield* Effect.result(relay.version)
     if (Result.isFailure(relayResult)) {
       if (!(relayResult.failure instanceof RelayClient.RelayUnreachable)) {
         if (json) {
@@ -121,7 +116,7 @@ const status = Command.make(
             extension: null,
             sessions: [],
             targets: [],
-            update: updateJson(update),
+            update: null,
           })
         }
         yield* stderrLine(`Relay status failed: ${relayResult.failure.message}`)
@@ -130,12 +125,11 @@ const status = Command.make(
       }
       const stopped = RelayLifecycle.stoppedRelayStatus(relay.endpoint)
       if (json) {
-        yield* emitJson({ ...stopped, update: updateJson(update), autoUpdate: autoUpdateStatus() })
+        yield* emitJson({ ...stopped, update: null, autoUpdate: autoUpdateStatus() })
         yield* stderrLine(`relay is not running at ${relay.endpoint}`)
       } else {
         yield* Console.log(`Relay: stopped (${relay.endpoint})`)
         yield* Console.log(`Run \`${cliCommand("execute")}\` (or any relay-backed command) to start it automatically.`)
-        if (updateLine) yield* Console.log(updateLine)
       }
       yield* exitWith(ExitCode.host)
       return
@@ -160,7 +154,7 @@ const status = Command.make(
         currentSession: current ?? null,
         sessions,
         targets,
-        update: updateJson(update),
+        update: null,
         autoUpdate: autoUpdateStatus(),
       })
       if (buildProblem) {
@@ -169,7 +163,6 @@ const status = Command.make(
       }
       return
     }
-    if (updateLine) yield* Console.log(updateLine)
     yield* Console.log(`Relay: ${relay.endpoint} (${version.version})`)
     if (buildProblem) {
       yield* Console.log(`Warning: ${buildProblem}`)
@@ -268,8 +261,7 @@ registerCliCommand(810, ({ packageRoot }) =>
       json: jsonFlag,
     },
     Effect.fn("Cli.doctor")(function* ({ json }) {
-      const update = yield* Effect.promise(() => updateNotice())
-      const report = yield* createDoctorReport({ packageRoot, update: updateJson(update) })
+      const report = yield* createDoctorReport({ packageRoot, update: null })
       if (json) {
         yield* emitJson(report)
       } else {

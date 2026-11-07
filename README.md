@@ -37,8 +37,7 @@ bun packages/desktop/scripts/stage-browse.ts \
   /path/to/browse/dist /path/to/browse/LICENSE
 ```
 
-For a standalone test, use a dedicated absolute directory for `OPENCODE_BROWSER_HOME` and set
-`OPENCODE_BROWSER_AUTO_UPDATE=off` for both the CLI and its MCP entry. Load `dist` unpacked and run
+For a standalone test, use a dedicated absolute directory for `OPENCODE_BROWSER_HOME` for both the CLI and its MCP entry. Load `dist` unpacked and run
 `browse pair` using the built executable. Use the executable with the `mcp` argument from any stdio MCP client.
 
 ## Tools
@@ -162,7 +161,6 @@ Escape hatches. Set them in the environment you start opencode (or your MCP clie
 | `OPENCODE_BROWSER_AGENT_WINDOW=separate` | Open agent tabs in a separate window (`current`: in the user's window), overriding the options page's *Where agents open their tabs* |
 | `OPENCODE_BROWSER_EXECUTE_SLICE_MS=2000` | Longest `execute` JavaScript may run without yielding before it is stopped (50 to 60000; every session waits meanwhile) |
 | `OPENCODE_BROWSER_GHOST_CURSOR=1` | Show the agent cursor on every agent tab outside recordings (pages can see it); `0` keeps it off. Overrides the options page's *Agent cursor* |
-| `OPENCODE_BROWSER_AUTO_UPDATE=notify` | Installs: only show new versions (`off`: don't check; `on`: install them when idle, the default). Overrides the status page's *Updates* |
 | `OPENCODE_BROWSER_HUMAN_INPUT=0` | Send input at full speed instead of human-like paths and pacing; `1` keeps them on. Overrides the options page's *Human-like input* |
 | `OPENCODE_BROWSER_CHALLENGE_WAIT_MS=15000` | How long `execute` waits for a bot check the browser clears by itself (0 to 60000; 0 reports it without waiting) |
 

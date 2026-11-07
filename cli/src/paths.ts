@@ -140,17 +140,10 @@ declare global {
   // Injected by build.ts: the store item from the release workflow's repository variables (RELEASING.md), and for a
   // dev build the unpacked extension zip it was built with, published to the release service.
   var __OPENCODE_BROWSER_STORE__: { readonly id?: string } | undefined
-  var __OPENCODE_BROWSER_EXTENSION__: DevExtension | undefined
 }
 
 /** A Chrome Web Store extension ID: 32 letters a to p. */
 const STORE_ITEM_ID = /^[a-p]{32}$/
-
-/**
- * browse's public Chrome Web Store item (the CWS_ITEM_ID repository variable, RELEASING.md). A checkout, or a package
- * built without one, still points users at this item: every channel installs browse from the store.
- */
-export const PUBLIC_STORE_ID = "mfnicocicmmlkpjnaffgihfjhdgjkdjg"
 
 export type StoreConfig = {
   /** The public store item, when the release that built this package was configured with one. */
@@ -158,34 +151,15 @@ export type StoreConfig = {
 }
 
 /**
- * The Chrome Web Store item this install knows. The published package carries the ID the release workflow baked in
+ * The Chrome Web Store item this install knows. The relay carries the ID its build baked in
  * (OPENCODE_BROWSER_STORE_ID at build time); the same variable at run time overrides it (testing a store build from a
  * checkout). Nothing else is trusted as a store ID: install sends the pairing code to the extension with this ID.
- * A stable npm install gets the extension from this item, a dev install from the release service (devExtension), and a
- * checkout loads dist/ unpacked.
+ * A checkout can also load dist/ unpacked.
  */
 export function storeConfig(env: NodeJS.ProcessEnv = process.env, baked = globalThis.__OPENCODE_BROWSER_STORE__): StoreConfig {
   const id = [env.OPENCODE_BROWSER_STORE_ID, baked?.id].find((value) => value && STORE_ITEM_ID.test(value))
   return id ? { id } : {}
 }
-
-/** The unpacked extension zip a dev build was built with: content-addressed on the release service, so exactly these bytes. */
-export type DevExtension = { readonly file: string; readonly sha256: string; readonly size: number }
-
-/** Anomaly's release service (github.com/anomalyco/release), where every push to dev publishes the dev extension. */
-export const RELEASE_SERVICE = "https://anoma.ly/release"
-
-/** The dev extension this package was built with; undefined for stable releases and checkouts. */
-export function devExtension(baked = globalThis.__OPENCODE_BROWSER_EXTENSION__): DevExtension | undefined {
-  return baked && /^[0-9a-f]{64}$/.test(baked.sha256) && /^[\w.-]+\.zip$/.test(baked.file) ? baked : undefined
-}
-
-/** Where the release service serves a file; OPENCODE_BROWSER_RELEASE_SERVICE points it elsewhere (tests; the sha256 is still checked). */
-export const devExtensionUrl = (extension: DevExtension, env: NodeJS.ProcessEnv = process.env) =>
-  `${(env.OPENCODE_BROWSER_RELEASE_SERVICE || RELEASE_SERVICE).replace(/\/+$/, "")}/browse/files/${extension.sha256}/${extension.file}`
-
-/** The folder a dev install's unpacked extension lives in (loaded once with Load unpacked; updates replace its files). */
-export const devExtensionFolder = (root = cacheRoot()) => path.join(root, "extension")
 
 /** The store page of an item. */
 export const storeUrl = (id: string) => `https://chromewebstore.google.com/detail/${id}`

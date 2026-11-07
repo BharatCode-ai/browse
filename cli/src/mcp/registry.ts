@@ -2,7 +2,6 @@ import type { Effect, Schema } from "effect"
 import type { McpSchema } from "effect/ai"
 import type { JsonObject } from "../protocol.ts"
 import type * as RelayClient from "../relay/client.ts"
-import type { UpdateNotice } from "../update.ts"
 import { optionalStringField, type CurrentSession } from "./schema.ts"
 
 export type McpToolSpec = {
@@ -26,7 +25,6 @@ export type McpToolContext = {
   readonly relay: RelayClient.Interface
   readonly currentSession: CurrentSession
   readonly packageRoot: string
-  readonly update: () => UpdateNotice | undefined
   readonly browserProperty: { readonly type: "string"; readonly description: string }
   readonly resolveSessionId: (input: unknown, field?: string) => string
   readonly establishCurrentSession: (id: string) => void
@@ -57,7 +55,6 @@ export function createMcpToolContext(options: {
   readonly relay: RelayClient.Interface
   readonly currentSession: CurrentSession
   readonly packageRoot: string
-  readonly update?: () => UpdateNotice | undefined
 }): McpToolContext {
   const browserProperty = {
     type: "string",
@@ -78,7 +75,6 @@ export function createMcpToolContext(options: {
     relay: options.relay,
     currentSession: options.currentSession,
     packageRoot: options.packageRoot,
-    update: options.update ?? (() => undefined),
     browserProperty,
     resolveSessionId,
     establishCurrentSession,

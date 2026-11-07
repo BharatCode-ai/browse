@@ -181,7 +181,7 @@ function Onboarding() {
               >
                 <Show when={!connected()}>
                   <Command text={remoteInstallCommand} label="Copy command" />
-                  <a class="link" href="https://github.com/arzvaak/browse#development" target="_blank" rel="noreferrer">
+                  <a class="link" href="https://github.com/BharatCode-ai/browse#development" target="_blank" rel="noreferrer">
                     Source setup instructions
                   </a>
                 </Show>
@@ -213,7 +213,7 @@ function Onboarding() {
               Extension settings
             </button>
           </Show>
-          <a class="link" href="https://github.com/arzvaak/browse#desktop-preview" target="_blank" rel="noreferrer">
+          <a class="link" href="https://github.com/BharatCode-ai/browse#desktop-preview" target="_blank" rel="noreferrer">
             Setup guide
           </a>
         </footer>

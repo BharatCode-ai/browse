@@ -1,5 +1,5 @@
 import { Effect } from "effect"
-import { autoUpdateModes, autoUpdateOverride, autoUpdateStatus, setStoredMode, storedMode, type AutoUpdateMode } from "../update/auto-update.ts"
+import { autoUpdateOverride, autoUpdateStatus, storedMode } from "../update/local-runtime.ts"
 import type { BrowserLink, BrowserLinks } from "./browser-links.ts"
 import type { ExtensionCommandInput } from "./rpc.ts"
 import type { GhostCursorTabs } from "../ghost-cursor.ts"
@@ -39,7 +39,7 @@ export function createRelaySettingsSync(options: {
     const human = humanInputOverride()
     const autoUpdate = autoUpdateOverride()
     return {
-      ...(autoUpdate ? { autoUpdate: { variable: process.env.OPENCODE_BROWSER_AUTO_UPDATE !== undefined ? "OPENCODE_BROWSER_AUTO_UPDATE" : "OPENCODE_BROWSER_UPDATE_CHECK", value: autoUpdate } } : {}),
+      ...(autoUpdate ? { autoUpdate: { variable: "BharatCode Desktop", value: autoUpdate } } : {}),
       ...(agentWindow ? { window: { variable: "OPENCODE_BROWSER_AGENT_WINDOW", value: agentWindow } } : {}),
       ...(ghostCursorEnv === undefined ? {} : { cursor: { variable: "OPENCODE_BROWSER_GHOST_CURSOR", value: ghostCursorEnv ? "always" : "off" } }),
       ...(human === undefined ? {} : { humanInput: { variable: "OPENCODE_BROWSER_HUMAN_INPUT", value: human ? "on" : "off" } }),
@@ -92,11 +92,6 @@ export function createRelaySettingsSync(options: {
     if (cursor === "off" || cursor === "always") link.cursor = cursor === "always"
     const human = params?.humanInput
     if (human === "on" || human === "off") link.humanInput = human === "on"
-    const autoUpdate = params?.autoUpdate
-    if (typeof autoUpdate === "string" && (autoUpdateModes as readonly string[]).includes(autoUpdate)) {
-      setStoredMode(autoUpdate as AutoUpdateMode)
-      relayLog("autoupdate.mode", { mode: autoUpdate })
-    }
     relayLog("extension.settings", { browser: link.id, cursor: (ghostCursorEnv ?? link.cursor) ? "always" : "off", humanInput: humanInputEnabled(link.humanInput) ? "on" : "off" })
     void ghostCursor.refresh()
     sendRelaySettings()
@@ -118,9 +113,7 @@ export function createRelaySettingsSync(options: {
       const relayOnly = Object.keys(extensionChanges).length === 0
       const fromExtension = relayOnly && !browsers.connected ? undefined : yield* extensionSettings("settings.get")
       const before = withRelaySettings(fromExtension ?? settingsFromExtension({ settings: {} }))
-      if (typeof writable.autoUpdate === "string") setStoredMode(writable.autoUpdate as AutoUpdateMode)
       const after = withRelaySettings(Object.keys(extensionChanges).length ? yield* extensionSettings("settings.set", extensionChanges) : (fromExtension ?? before))
-      if (writable.autoUpdate !== undefined) sendRelaySettings()
       relayLog("settings.set", { changes: Object.keys(writable).join(",") || undefined, overridden: Object.keys(requested).filter((key) => key in overrides).join(",") || undefined })
       return describeChanges({ before, after, requested, overrides })
     }),

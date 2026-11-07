@@ -27,7 +27,7 @@ import {
   type AgentReceipt,
 } from "./setup/agent-config.ts"
 import { agentFlags, agentPlan, pickAgents } from "./setup/agent-picker.ts"
-import { autoUpdateStatus, describeAutoUpdate } from "./update/auto-update.ts"
+import { describeAutoUpdate } from "./update/local-runtime.ts"
 import { mintPairingCode, pairingCodeKey, pendingPairingCodeKeys } from "./relay/browser-pairing.ts"
 import { cliCommand, compiledBinary, entryCommand, installCommand, oldStoreMarker, scriptEntry } from "./paths.ts"
 import {
@@ -56,7 +56,6 @@ import {
   reloadOutdatedExtension,
   set,
   settledExtensionStatus,
-  syncDev,
   uninstall,
   type ExtensionStatus,
 } from "./setup/commands.ts"
@@ -305,7 +304,6 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
     )
   if (args.includes("--remote")) return installRemote(entry, tty)
 
-  await syncDev()
   const initial = await settledExtensionStatus(entry)
   const connected = initial?.connected ? initial : undefined
   const pairedOffline = initial?.pairingState === "paired-offline"
@@ -460,7 +458,7 @@ export function printSetupStatus() {
   log(`Version:   ${runtime ? `${runtime.version ?? "unknown"} (${runtime.entry})` : "not installed"}`)
   log(`opencode:  ${settings?.opencode ?? findOpencode([]) ?? "not found"}`)
   log(mcpServers()[MCP_NAME] ? `MCP:       "${MCP_NAME}" configured` : "MCP:       not configured")
-  log(describeAutoUpdate(autoUpdateStatus()))
+  log(describeAutoUpdate())
   log(`Files:     ${paths.config}, ${paths.data}, ${paths.state}, ${paths.cache}`)
   log(`Logs:      ${path.join(paths.state, "logs")}`)
   log("")

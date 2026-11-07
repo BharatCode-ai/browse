@@ -2,12 +2,10 @@ import crypto from "node:crypto"
 import path from "node:path"
 import { Config, Effect, Option } from "effect"
 import type { WebSocket } from "ws"
-import { createAutoUpdater, installedRuntime } from "./update/auto-update.ts"
 import { BrowserLinks, type BrowserLink } from "./relay/browser-links.ts"
 import { CdpClientPool } from "./cdp/client-pool.ts"
 import { CdpRouter } from "./cdp/router.ts"
 import { CdpRuntime } from "./cdp/runtime.ts"
-import { installedDevExtension, syncDevExtension } from "./setup/dev-extension.ts"
 import { ExecuteSandbox } from "./execute.ts"
 import { pruneStaleExecuteFilesDirectories } from "./execute-realm.ts"
 import { FlightRecorderRelay } from "./recording-relay/flight-recorder.ts"
@@ -15,7 +13,7 @@ import { GhostCursorTabs } from "./ghost-cursor.ts"
 import { HandoffRegistry } from "./session-manager/handoff.ts"
 import { createHttpRequestHandler } from "./http-api.ts"
 import { forgetTab } from "./execute/human-input.ts"
-import { devExtension, PUBLIC_STORE_ID, stateRoot, storeConfig } from "./paths.ts"
+import { stateRoot, storeConfig } from "./paths.ts"
 import { ProtectedFrameTracker } from "./cdp/protected-frames.ts"
 import type { CdpEvent, JsonObject } from "./protocol.ts"
 import { RecordingRelay } from "./recording-relay.ts"
@@ -82,9 +80,8 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   const browserId = crypto.randomUUID()
   const endpointUrl = `http://${formatHostForUrl(host)}:${port}`
   const additionalChromeExtensionOrigins = new Set(options.additionalExtensionOrigins ?? [])
-  // The store build installs from, for a checkout too: install points every channel at it (paths.ts PUBLIC_STORE_ID).
-  const storeId = storeConfig().id ?? PUBLIC_STORE_ID
-  additionalChromeExtensionOrigins.add(`chrome-extension://${storeId}`)
+  const storeId = storeConfig().id
+  if (storeId) additionalChromeExtensionOrigins.add(`chrome-extension://${storeId}`)
   const sessionCatalog = options.sessionCatalogPath === null
     ? undefined
     : new SessionCatalog(options.sessionCatalogPath ?? defaultSessionCatalogPath(port))
@@ -98,7 +95,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     catch: (cause) => new Error("Create the relay token", { cause }),
   })
   const browsers = new BrowserLinks()
-  const { sendToExtension, sendExtensionBestEffort, sendToEveryBrowser, sendToEach } = createExtensionCommands({ browsers })
+  const { sendToExtension, sendExtensionBestEffort, sendToEach } = createExtensionCommands({ browsers })
 
   const debugEnabled = yield* Config.Boolean("OPENCODE_BROWSER_DEBUG").pipe(Config.withDefault(false))
   const debugLog = debugEnabled ? (line: string) => console.error(`[bc ${new Date().toISOString().slice(11, 23)}] ${line}`) : undefined
@@ -418,12 +415,11 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     flightRecorder,
     rootLifecycle,
     sendToExtension,
-    sendToEveryBrowser,
     isTabRecorded,
     detachTab,
     audit,
   })
-  const { shutdown: shutdownControl, updates, sendUpdateNotice, releaseRelayTarget, browserIdle, startTimers, stopTimers } = housekeeping
+  const { shutdown: shutdownControl, releaseRelayTarget, startTimers, stopTimers } = housekeeping
 
   const toggleTab = Effect.fnUntraced(function* (tabId: number) {
     if (registry.tabTargets.has(tabId)) return yield* detachTab(tabId)
@@ -574,8 +570,6 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     sendDebuggerCommand,
     sendExtensionBestEffort,
     applyExtensionSettings: settingsSync.applyExtensionSettings,
-    hasUpdateNotice: () => updates.current !== undefined,
-    sendUpdateNotice,
     announceTab,
     browsersChanged,
     refreshPageStatus: presentation.refreshPageStatus,
@@ -633,7 +627,6 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   })
 
   let relayReady = false
-  let autoUpdater: ReturnType<typeof createAutoUpdater> | undefined
 
   const { httpServer, websocketServer } = createRelayTransportServers({
     host,
@@ -642,7 +635,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     authToken,
     additionalChromeExtensionOrigins,
     isReady: () => relayReady,
-    onAgentHttpActivity: () => housekeeping.noteAgentActivity(),
+
     relayRequestHandler,
     shutdownControl,
     sessions,
@@ -657,7 +650,6 @@ const makeRelay = Effect.fnUntraced(function* (options: {
 
   const cleanup = Effect.fnUntraced(function* () {
     stopTimers()
-    autoUpdater?.stop()
     yield* shutdownControl.close().pipe(Effect.ignore)
     yield* sessions.closeAll()
     yield* rootLifecycle.close()
@@ -714,28 +706,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         }))
       }
       relayReady = true
-      void updates.refresh()
       startTimers()
-      const runtime = managed ? installedRuntime() : undefined
-      if (runtime) {
-        autoUpdater = createAutoUpdater({
-          runtime,
-          isIdle: browserIdle,
-          log: relayLog,
-          onChange: () => settingsSync.sendRelaySettings(),
-        })
-        autoUpdater.start()
-      }
-      const dev = devExtension()
-      if (dev && installedDevExtension()) {
-        syncDevExtension(dev).then(
-          (result) => {
-            if (result === "updated") relayLog("extension.dev_updated", { file: dev.file })
-            for (const link of browsers.list()) if (link.local) handshake.reloadOutdatedDevExtension(link)
-          },
-          (error: unknown) => relayLog("extension.dev_update_failed", { error: (error as Error).message }),
-        )
-      }
       relayLog("relay.ready", { url: endpointUrl, version: opencodeBrowserVersion, build: opencodeBrowserBuildId, pid: process.pid, managed })
     }),
     (error) => Effect.gen(function* () {

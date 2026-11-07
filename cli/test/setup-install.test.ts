@@ -5,7 +5,7 @@ import path from "node:path"
 import { parse } from "jsonc-parser"
 import { agentLocations, agentNames, callingAgent, editAgentConfig } from "../src/setup/agent-config.ts"
 import { agentFlags, agentPlan } from "../src/setup/agent-picker.ts"
-import { STORE_URL } from "../src/setup/environment.ts"
+const STORE_URL = "https://chromewebstore.google.com/detail/abcdefghijklmnopabcdefghijklmnop"
 import { configureMcp, installedExtensionVersion, installedRuntime, installWaitTimeout, locateExtension, manualMcpEntry, pairStoreExtension, relayNotRestarted, remoteRelayAddresses, remoteRelayLines, removeMcp, waitForExtension, type Browser, type Detection, type LocateOptions } from "../src/setup.ts"
 
 const browser = (name: string): Browser => ({ name, userData: `/data/${name}`, manifests: [], defaultIDs: [], executables: [] })
@@ -157,7 +157,7 @@ test("every picker choice has one user-scoped destination; config dirs and binar
 })
 
 /** Runs locateExtension with recording effects: nothing real is opened, revealed or copied. */
-function run(overrides: Partial<LocateOptions> = {}, results: { open?: boolean } = {}) {
+function run(overrides: Partial<LocateOptions> = {}, results: { open?: boolean } = {}, withStore = true) {
   const calls: { open: [string, string][]; reveal: string[]; copy: string[] } = { open: [], reveal: [], copy: [] }
   const lines: string[] = []
   const options: LocateOptions = {
@@ -166,6 +166,7 @@ function run(overrides: Partial<LocateOptions> = {}, results: { open?: boolean }
     detections: [none(chrome)],
     preferred: chrome,
     env: { ssh: false, display: true, tty: true, platform: "darwin" },
+    ...(withStore ? { storeUrl: STORE_URL } : {}),
     ...overrides,
   }
   const outcome = locateExtension(options, {
@@ -291,10 +292,10 @@ describe("the store item", () => {
     expect(output).not.toContain("unpacked")
   })
 
-  test("a checkout, with no store item baked in, points at browse's public item", () => {
-    const { output } = run()
-    expect(output).toContain("https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg")
-    expect(output).not.toContain("unpacked")
+  test("a checkout without a configured store item uses unpacked guidance", () => {
+    const { output } = run({}, {}, false)
+    expect(output).toContain("Load the BharatCode Browse extension")
+    expect(output).not.toContain("chromewebstore.google.com")
   })
 })
 

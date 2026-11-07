@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url"
 import { browserUnresponsive, extensionProtocolAdvice, extensionReconnectAlarmPeriodMs } from "../protocol.ts"
 import * as RelayClient from "./client.ts"
 import { RelayShutdownRequest, type ExtensionStatus, type RelayVersion } from "./schema.ts"
-import { compareVersions, installedRuntime, installedVersion } from "../update/auto-update.ts"
+import { compareVersions, installedRuntime, installedVersion } from "../update/local-runtime.ts"
 import { cliCommand, compiledBinary, installCommand, scriptEntry } from "../paths.ts"
 import { opencodeBrowserBuildId } from "../version.ts"
 
@@ -59,7 +59,7 @@ export class ExtensionProtocolIncompatible extends Schema.TaggedError<ExtensionP
   },
 ) {}
 
-/** This process runs an installed runtime that the path now has a newer version behind (auto-update.ts). */
+/** This process runs an installed runtime that the path now has a newer version behind (local-runtime.ts). */
 function supersededRuntime(): boolean {
   try {
     const runtime = installedRuntime()

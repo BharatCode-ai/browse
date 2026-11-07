@@ -21,7 +21,6 @@ import {
   wrapToken,
   type HandshakeTranscript,
 } from "./browser-pairing.ts"
-import { installedDevExtension } from "../setup/dev-extension.ts"
 import type { ExtensionCommandInput } from "./rpc.ts"
 import { cliCommand, fromCheckout, installCommand, oldStoreMarker, storeUrl } from "../paths.ts"
 import {
@@ -80,7 +79,6 @@ export class ExtensionHandshake {
   private lastRefused = 0
   private hasPairedBrowser = Object.keys(readBrowserPairings()).length > 0
   private legacyExtensionReloaded = false
-  private devExtensionReloadedFor: string | undefined
 
   constructor(private readonly options: {
     readonly port: number
@@ -115,15 +113,6 @@ export class ExtensionHandshake {
     for (const link of links) link.socket.close(4006, "Pairing revoked: run `pair` and enter the code to pair again")
     if (links.length) relayLog("extension.revoked", { browser: links.map((link) => link.id).join(", ") })
     return links.length > 0
-  }
-
-  reloadOutdatedDevExtension(link: BrowserLink): void {
-    const folderBuild = installedDevExtension()?.build
-    if (!folderBuild || !link.rpc.connected || link.origin !== stableUnpackedExtensionOrigin) return
-    if (link.build === folderBuild || this.devExtensionReloadedFor === folderBuild) return
-    this.devExtensionReloadedFor = folderBuild
-    relayLog("extension.dev_reload", { browser: link.id, from: link.build, to: folderBuild })
-    this.options.sendExtensionBestEffort({ method: "runtime.reload" }, link)
   }
 
   resolveSessionBrowser(requested?: string, session?: OpenCodeBrowserSession): BrowserLink | { error: string; unavailable?: true } {
@@ -449,11 +438,6 @@ export class ExtensionHandshake {
     link.build = getString(message.params, "build")
     link.origin = origin
     link.local = local
-    if (local) {
-      setTimeout(() => {
-        if (browsers.ofSocket(socket) === link) this.reloadOutdatedDevExtension(link)
-      }, 2_000).unref()
-    }
     relayLog("extension.connected", {
       browser: link.id,
       name: link.name,

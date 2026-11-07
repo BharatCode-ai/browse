@@ -264,7 +264,7 @@ describe("tool output schemas", () => {
     expect(Object.keys(read.settings).sort()).toEqual([...agentSettingKeys].sort())
     expect(Schema.is(spec.outputSchema!)(read)).toBe(true)
     const failure = await Effect.runPromise(Effect.flip(spec.handle({ set: { autoUpdate: "notify" } }) as Effect.Effect<unknown, Error>))
-    expect(failure.message).toContain("browse settings set autoUpdate")
+    expect(failure.message).toContain("BharatCode Desktop distributes relay updates")
   })
 
   test("execute structured content validates against its schema and carries the value once", () => {

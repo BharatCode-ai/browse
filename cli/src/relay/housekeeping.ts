@@ -11,7 +11,6 @@ import type { OpenCodeBrowserSessions } from "../session-manager.ts"
 import { isMcpSession } from "../session-manager.ts"
 import type { HandoffRegistry } from "../session-manager/handoff.ts"
 import { startJournalRetention } from "../session-manager/journal.ts"
-import { createUpdateWatcher } from "../update.ts"
 import type { BrowserLinks } from "./browser-links.ts"
 import type { RelayLifecycleEvent } from "./lifecycle-log.ts"
 import { relayLog } from "./log.ts"
@@ -37,7 +36,7 @@ export function tabIsBusy(tabId: number, deps: TabBusyDependencies): boolean {
   return deps.sessions.isExecuting(sessionId) || deps.sessions.hasPendingWork(sessionId) || session.sandbox.networkStatus().active
 }
 
-/** The relay's periodic work: orphan collection, idle tab reaping, keepalives and update checks. */
+/** The relay's periodic work: orphan collection, idle tab reaping, and keepalives. */
 export function createRelayHousekeeping(options: {
   readonly instanceId: string
   readonly managed: boolean
@@ -58,7 +57,6 @@ export function createRelayHousekeeping(options: {
   readonly flightRecorder: FlightRecorderRelay
   readonly rootLifecycle: RootTargetLifecycle
   readonly sendToExtension: (command: ExtensionCommandInput) => Effect.Effect<JsonObject, Error>
-  readonly sendToEveryBrowser: (command: ExtensionCommandInput) => void
   readonly isTabRecorded: (tabId: number) => boolean
   readonly detachTab: (tabId: number) => Effect.Effect<void, Error>
   readonly audit: (event: RelayLifecycleEvent) => Effect.Effect<void, Error>
@@ -83,27 +81,16 @@ export function createRelayHousekeeping(options: {
     flightRecorder,
     rootLifecycle,
     sendToExtension,
-    sendToEveryBrowser,
     isTabRecorded,
     detachTab,
     audit,
   } = options
 
   const clientGoneSince = new Map<string, number>()
-  let lastAgentActivity = Date.now()
-  const autoUpdateIdleMs = Number(process.env.OPENCODE_BROWSER_AUTO_UPDATE_IDLE_MS) || 15 * 60_000
   let stopJournalRetention: (() => void) | undefined
-  let updateTimer: NodeJS.Timeout | undefined
   let orphanTimer: NodeJS.Timeout | undefined
   let keepaliveTimer: NodeJS.Timeout | undefined
   let idleReapTimer: NodeJS.Timeout | undefined
-
-  const updates = createUpdateWatcher({ onChange: () => sendUpdateNotice() })
-
-  const sendUpdateNotice = () => {
-    const notice = updates.current
-    sendToEveryBrowser({ method: "update.notice", ...(notice ? { params: { summary: notice.summary, command: notice.command } } : {}) })
-  }
 
   const releaseRelayTarget = Effect.fnUntraced(function* (targetId: string) {
     const first = registry.targetsByTargetId.get(targetId)
@@ -189,21 +176,6 @@ export function createRelayHousekeeping(options: {
     for (const id of clientGoneSince.keys()) if (!sessions.sessions.has(id)) clientGoneSince.delete(id)
   }
 
-  /** Whether an automatic update can restart the relay without interrupting anyone. */
-  const browserIdle = () =>
-    shutdown.accepting &&
-    !Array.from(cdpClients).some((client) => !cdpClients.isSandbox(client)) &&
-    !sessions.hasActiveNetworkCapture() &&
-    recordingRelay.recordingTabIds().length === 0 &&
-    flightRecorder.activeTabIds().length === 0 &&
-    !Array.from(activeHandoffTabs.values()).some((tabs) => tabs.size > 0) &&
-    !Array.from(sessions.sessions.keys()).some((id) => sessions.isExecuting(id) || sessions.hasPendingWork(id)) &&
-    Date.now() - lastAgentActivity >= autoUpdateIdleMs
-
-  const noteAgentActivity = () => {
-    lastAgentActivity = Date.now()
-  }
-
   const isTabBusy = (tabId: number): boolean => tabIsBusy(tabId, { registry, sessions, handoffs, isTabRecorded })
 
   const detachIdleUserTarget = Effect.fnUntraced(function* (targetId: string) {
@@ -218,8 +190,6 @@ export function createRelayHousekeeping(options: {
       isLive: (sessionId) => sessions.sessions.has(sessionId),
       onError: (error) => console.error("Failed to prune session journals", error),
     })
-    updateTimer = setInterval(() => void updates.refresh(), 60 * 60 * 1000)
-    updateTimer.unref()
     orphanTimer = setInterval(collectOrphans, Math.max(1_000, Math.min(30_000, Math.floor(clientGoneGraceMs / 2))))
     orphanTimer.unref()
     if (keepaliveIntervalMs > 0) {
@@ -261,8 +231,6 @@ export function createRelayHousekeeping(options: {
   const stopTimers = () => {
     stopJournalRetention?.()
     stopJournalRetention = undefined
-    clearInterval(updateTimer)
-    updateTimer = undefined
     clearInterval(orphanTimer)
     orphanTimer = undefined
     clearInterval(keepaliveTimer)
@@ -271,5 +239,5 @@ export function createRelayHousekeeping(options: {
     idleReapTimer = undefined
   }
 
-  return { shutdown, updates, sendUpdateNotice, releaseRelayTarget, collectOrphans, browserIdle, noteAgentActivity, startTimers, stopTimers }
+  return { shutdown, releaseRelayTarget, collectOrphans, startTimers, stopTimers }
 }

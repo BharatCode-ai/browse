@@ -16,9 +16,8 @@ import {
   revokeBrowserToken,
   writeExtensionPairing,
 } from "../relay/browser-pairing.ts"
-import { syncDevExtension } from "./dev-extension.ts"
-import { cliCommand, compiledBinary, defaultSettingsPath, devExtensionFolder, entryCommand, installedBinaryPath, installerBinaryPath, installCommand, runningEntry } from "../paths.ts"
-import { runCommand } from "../update/auto-update.ts"
+import { cliCommand, compiledBinary, defaultSettingsPath, entryCommand, installedBinaryPath, installerBinaryPath, installCommand, runningEntry } from "../paths.ts"
+import { runCommand } from "../update/local-runtime.ts"
 import { unpackedExtensionId } from "../protocol.ts"
 import { parseHostname, readRelayConfig, writeRelayConfig } from "../relay/config.ts"
 import { relayAuthorization } from "../relay/secrets.ts"
@@ -27,7 +26,6 @@ import { isInstallerBinary, removeBinaryInstall, samePath } from "./binary.ts"
 import { revealFolder } from "./browsers.ts"
 import {
   checkoutExtensionDirs,
-  dev,
   fail,
   files,
   fromSource,
@@ -128,25 +126,12 @@ export async function reloadOutdatedExtension(
 }
 
 /**
- * Puts this version's dev extension in <cache root>/extension (paired, for a developer who loads it), silently: install
- * points every channel at the store build. Fails install when it can't be downloaded.
- */
-export async function syncDev() {
-  if (!dev) return
-  try {
-    await syncDevExtension(dev, { root: paths.cache })
-  } catch (error) {
-    fail(`Could not get the dev extension: ${(error as Error).message}`)
-  }
-}
-
-/**
  * Writes a fresh one-time code into every unpacked extension folder this install manages (a checkout's, or a dev
  * install's). It's good for an hour and only until an extension used it, so the folder holds nothing reusable; an
  * extension that already has its key ignores it.
  */
 export function pairUnpacked() {
-  const directories = [...checkoutExtensionDirs, ...(dev ? [devExtensionFolder(paths.cache)] : [])].filter((directory) =>
+  const directories = checkoutExtensionDirs.filter((directory) =>
     existsSync(path.join(directory, "manifest.json")),
   )
   if (directories.length === 0) return
@@ -159,13 +144,12 @@ export async function extension() {
   if (!folder) {
     if (!STORE_URL)
       fail(
-        "This package doesn't know its Chrome Web Store item. Install a released version (`npx @opencode/browse install`), or set up browse from a checkout.",
+        "This package doesn't know its Chrome Web Store item. Use BharatCode Desktop or set up Browse from a checkout.",
       )
     log(`Install browse from the Chrome Web Store: ${STORE_URL}`)
     log(`Then run \`${cliCommand("install")}\` again to pair it.`)
     return
   }
-  await syncDev()
   if (!existsSync(path.join(folder, "manifest.json")))
     fail(`${folder} has no built extension. Run \`${installCommand()}\` first.`)
   pairUnpacked()

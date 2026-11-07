@@ -48,6 +48,10 @@ export function locateExtension(options: LocateOptions, effects: Effects = syste
   const blocked = options.detections.filter((detection) => detection.blocked).map((detection) => detection.browser.name)
   if (blocked.length) log(`! Couldn't check ${blocked.join(", ")} for browse (${blockedReason()})`)
   const target = options.preferred ?? options.detections.find((detection) => !detection.blocked)?.browser
+  if (!listing) {
+    log("Load the BharatCode Browse extension from BharatCode Desktop or from this checkout's dist folder.")
+    return "guided"
+  }
   const interactive = options.allowOpen && options.env.display && !options.env.ssh
   // A browser that couldn't be checked may already have it: don't open anything over the user's work.
   const opened =

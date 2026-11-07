@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// browse: one command for setup, updates and driving the browser.
-//   Setup (setup.ts): install, extension, pair, uninstall. Updating (update.ts): update.
+// Browse CLI for setup and browser control.
+//   Setup (setup.ts): install, extension, pair, uninstall.
 //   Driving the browser (cli.ts): serve, relay, execute, session, network, secrets, recording, journal,
 //   doctor, skill, mcp, status. The relay is the local server agents use; the extension connects to it.
 // `browse mcp` runs the MCP server over stdio (as does the bundle invoked as `opencode-browser-mcp`).
@@ -40,21 +40,12 @@ if (command !== "--version" && command !== "-v" && !askedForHelp && !process.env
 if (command === "--version" || command === "-v") {
   const opencodeBrowserVersion = embeddedVersion ?? (await import("./version.ts")).opencodeBrowserVersion
   process.stdout.write(`${opencodeBrowserVersion}\n`)
-} else if (command === "mcp" && process.env.OPENCODE_BROWSER_MCP_DIRECT !== "1" && (await import("./mcp/supervisor.ts")).supervisesMcp()) {
-  // An installed binary or npm global package: supervise the server so updates swap it (mcp/supervisor.ts).
-  const { runBinaryMcp } = await import("./mcp/supervisor.ts")
-  await runBinaryMcp(process.argv.slice(3))
 } else if (invokedAs === "opencode-browser-mcp" || (command === "mcp" && process.argv.length === 3)) {
   const { NodeRuntime } = await import("@effect/platform-node")
   const { runMcpServer } = await import("./mcp.ts")
   runMcpServer.pipe(NodeRuntime.runMain)
-} else if (command === "self-update" || command === "runtime-switch") {
-  // The relay's auto-update children (auto-update.ts); not for people.
-  const { runSelfUpdate, runRuntimeSwitch } = await import("./update/runtime-update.ts")
-  await (command === "self-update" ? runSelfUpdate : runRuntimeSwitch)(process.argv.slice(3))
 } else if (command === "update" && !askedForHelp) {
-  const { runUpdateCommand } = await import("./update.ts")
-  await runUpdateCommand(process.argv.slice(3))
+  process.stdout.write("Relay updates are delivered with BharatCode Desktop.\n")
 } else if (command && setupCommands.has(command) && !askedForHelp) {
   const { runSetup } = await import("./setup.ts")
   await runSetup(command, process.argv.slice(3))
@@ -81,9 +72,6 @@ if (command === "--version" || command === "-v") {
                                  \`--revoke legacy\` retires the shared code of earlier versions
   set hostname <address>         Where the relay listens: 127.0.0.1 (this computer, the default) or 0.0.0.0
                                  (browsers on other computers can connect too, after pairing)
-  update [--check]               Update now: rerun whatever installed browse (the install script for a binary
-                                 install, npm install -g for an npm one); --check only says whether there's an
-                                 update. A git clone pulls the newer commits and runs setup again.
   uninstall [--yes]              Remove everything install set up (--yes skips confirming that stored
                                  secret profiles are deleted)
 

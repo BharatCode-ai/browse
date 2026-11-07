@@ -3,7 +3,7 @@ import { createHash } from "node:crypto"
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
-import { runCommand, installedVersion } from "../update/auto-update.ts"
+import { runCommand, installedVersion } from "../update/local-runtime.ts"
 import { cliCommand, compiledBinary, entryCommand, scriptEntry } from "../paths.ts"
 import { opencodeBrowserVersion } from "../version.ts"
 import { installBinaryRuntime } from "./binary.ts"
@@ -220,7 +220,7 @@ export async function installRuntime(): Promise<{ entry: string; version: string
   const alreadyGlobal = !!(globalPackage && path.resolve(packageRoot) === path.resolve(globalPackage))
   if (!alreadyGlobal || spec) {
     // npx's cache is evictable, so an npm install becomes a global one: agents then run a stable path, and updates are
-    // `npm install -g` (auto-update.ts). The channel matches this build.
+    // `npm install -g` (local-runtime.ts). The channel matches this build.
     const target = spec ?? `${PACKAGE}@${opencodeBrowserVersion.includes("-dev.") ? "dev" : "latest"}`
     const installed = await runCommand("npm", ["install", "-g", target], { timeoutMs: 10 * 60_000 })
     if (installed.status !== 0)

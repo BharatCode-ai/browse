@@ -1,6 +1,6 @@
 // The settings page (settings.html, the extension's options page). One card: the connection's state at the top, then a
 // row per setting (this browser's name, where agent tabs open and how they're grouped and closed, the agent cursor,
-// human-like input and handoff notifications, updates), then an Advanced section for the relay's address and pairing
+// human-like input and handoff notifications), then an Advanced section for the relay's address and pairing
 // code, reconnect and diagnostics. Each row is a chrome.storage.local key the background reads when it needs it (or
 // sends to the relay, for the cursor and input); a setting the relay's environment fixes is shown as such.
 import { createSignal, Show, type JSX } from "solid-js"
@@ -35,10 +35,9 @@ import {
 import { unpackedExtensionId } from "../../cli/src/protocol"
 import { describeStatus } from "./describe"
 import { RelayForm } from "./relay-form"
-import { applyColorScheme, Brand, CopyBox, createRelay, createStored, Note, Rich } from "./ui"
+import { applyColorScheme, Brand, createRelay, createStored, Note, Rich } from "./ui"
 import "./settings.css"
 
-const capitalized = (text: string) => text.charAt(0).toUpperCase() + text.slice(1)
 
 function Settings() {
   const relay = createRelay()
@@ -116,15 +115,6 @@ function Settings() {
             )}
           </Show>
         </header>
-
-        <Show when={state()?.update}>
-          {(update) => (
-            <Section title="update available">
-              <p class="row-desc">{capitalized(update().summary)}. Run this in a terminal, or ask your agent to update browse:</p>
-              <CopyBox text={update().command} />
-            </Section>
-          )}
-        </Show>
 
         <Section title="this browser">
           <Row
@@ -215,35 +205,6 @@ function Settings() {
             </Switch>
           </Row>
         </Section>
-
-        <Show when={state()?.autoUpdate?.install === "npm" && state()?.autoUpdate}>
-          {(autoUpdate) => (
-            <Section title="updates">
-              <Row label="When a new version is published" description={updateFacts(autoUpdate())}>
-                <SegmentedControl
-                  class="seg-update"
-                  value={autoUpdate().mode}
-                  onChange={(value) => {
-                    if (value === "on" || value === "notify" || value === "off") relay.send({ type: "autoUpdate.set", mode: value })
-                  }}
-                >
-                  <SegmentedControlItem value="on">Install</SegmentedControlItem>
-                  <SegmentedControlItem value="notify">Tell me</SegmentedControlItem>
-                  <SegmentedControlItem value="off">Off</SegmentedControlItem>
-                </SegmentedControl>
-              </Row>
-              <Show when={autoUpdate().overriddenBy}>
-                {(variable) => (
-                  <Note tone="warn">
-                    In effect:{" "}
-                    {({ on: "automatic", notify: "notify only", off: "off" } satisfies Record<AutoUpdateMode, string>)[autoUpdate().effective]}. Set
-                    by <code>{variable()}</code> on the relay.
-                  </Note>
-                )}
-              </Show>
-            </Section>
-          )}
-        </Show>
 
         <div class="hr" />
         <details class="advanced" ref={advanced}>
@@ -399,16 +360,6 @@ function Override(props: { overrides: RelayOverrides | undefined; setting: keyof
   )
 }
 
-/** The relay's update state, in a sentence or two. */
-function updateFacts(autoUpdate: NonNullable<AgentRelayState["autoUpdate"]>) {
-  return [
-    autoUpdate.version ? `Installed: ${autoUpdate.version}${autoUpdate.channel === "dev" ? " (dev channel)" : ""}.` : "",
-    autoUpdate.pending ? `${autoUpdate.pending} is ready and switches in once no agent is using the browser.` : "",
-    !autoUpdate.pending && autoUpdate.latest && autoUpdate.latest !== autoUpdate.version ? `Newest: ${autoUpdate.latest}.` : "",
-  ]
-    .filter(Boolean)
-    .join(" ")
-}
 
 applyColorScheme()
 render(() => <Settings />, document.getElementById("root")!)

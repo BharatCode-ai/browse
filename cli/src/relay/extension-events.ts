@@ -43,8 +43,6 @@ export function createExtensionEventHandler(options: {
   readonly sendDebuggerCommand: (command: { readonly tabId: number; readonly sessionId?: string; readonly method: string; readonly params: JsonObject }) => Effect.Effect<JsonObject, Error>
   readonly sendExtensionBestEffort: (command: ExtensionCommandInput, link?: BrowserLink) => void
   readonly applyExtensionSettings: (link: BrowserLink, params: JsonObject | undefined) => void
-  readonly hasUpdateNotice: () => boolean
-  readonly sendUpdateNotice: () => void
   readonly announceTab: (tabId: number) => void
   readonly browsersChanged: () => void
   readonly refreshPageStatus: (tabId: number) => void
@@ -81,8 +79,6 @@ export function createExtensionEventHandler(options: {
     sendDebuggerCommand,
     sendExtensionBestEffort,
     applyExtensionSettings,
-    hasUpdateNotice,
-    sendUpdateNotice,
     announceTab,
     browsersChanged,
     refreshPageStatus,
@@ -266,7 +262,6 @@ export function createExtensionEventHandler(options: {
           announcedAgentTabIds.clear()
           for (const [targetId, known] of ownersAcrossReconnect) if (known.browser === link.key) ownersAcrossReconnect.delete(targetId)
           link.rpc.markReady()
-          if (hasUpdateNotice()) sendUpdateNotice()
           for (const target of registry.listRootTargets()) if (mine(target.tabId)) refreshTabGrouping(target.tabId)
           browsersChanged()
           if (!sweptBrowsers.has(link.key)) {
