@@ -25,8 +25,9 @@ supported Desktop relay versions before releasing the extension.
 `Prepare extension (build only)` runs on `codex/browse-release-*` branches, without
 publishing a release, changing Desktop, or contacting a store. It checks both
 TypeScript projects and test suites and uploads the keyless extension ZIP with
-`SHA256SUMS`, `SOURCE_SHA`, and builder versions. The ZIP includes the source license
-and runtime files only; it contains no pairing file, source maps, or test hooks.
+`SHA256SUMS`, `SOURCE_SHA`, and builder versions. The ZIP includes runtime files,
+the source license, and generated bundled-dependency notices only; it contains no
+pairing file, source maps, or test hooks.
 Both Vite builds use the minimum Chrome version declared in the manifest.
 
 The browser job downloads that exact ZIP and tests it against a native relay built

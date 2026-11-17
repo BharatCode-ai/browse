@@ -28,6 +28,7 @@ test("store archive rejects keys, pairing data, missing runtime pages and licens
     for (const name of ["background.js", "content.js"]) await writeFile(path.join(staging, name), "/* 19989 */")
     for (const name of ["welcome", "onboarding", "settings", "offscreen"]) await writeFile(path.join(staging, `${name}.html`), "<!doctype html>")
     await cp(path.resolve(import.meta.dir, "../LICENSE"), path.join(staging, "LICENSE.txt"))
+    await writeFile(path.join(staging, "THIRD_PARTY_NOTICES.txt"), "Fixture dependency notices")
     const check = async () => {
       await rm(zip, { force: true })
       await $`zip -qrX ${zip} .`.cwd(staging).quiet()
@@ -44,6 +45,8 @@ test("store archive rejects keys, pairing data, missing runtime pages and licens
     expect((await check()).some(problem => problem.includes("missing offscreen.html"))).toBe(true)
     await rm(path.join(staging, "LICENSE.txt"))
     expect((await check()).some(problem => problem.includes("missing LICENSE.txt"))).toBe(true)
+    await writeFile(path.join(staging, "THIRD_PARTY_NOTICES.txt"), "")
+    expect((await check()).some(problem => problem.includes("THIRD_PARTY_NOTICES.txt is empty"))).toBe(true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

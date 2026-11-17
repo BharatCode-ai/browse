@@ -23,6 +23,7 @@ export default defineConfig(({ mode }) => ({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    license: { fileName: "THIRD_PARTY_NOTICES.txt" },
     target: `chrome${manifest.minimum_chrome_version}`,
     minify: mode !== "development",
     sourcemap: mode === "development" ? "inline" : false,

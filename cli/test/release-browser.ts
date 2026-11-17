@@ -25,6 +25,7 @@ const originalDigest = await digest()
 let relay: ChildProcess | undefined
 let browser: BrowserContext | undefined
 let stage = "extract archive"
+const sensitive: string[] = []
 const fixture = http.createServer((_request, response) => {
   response.setHeader("content-type", "text/html")
   response.end('<title>Browse release fixture</title><label>Name<input></label><button onclick="document.querySelector(\'output\').textContent=document.querySelector(\'input\').value">Save</button><output></output>')
@@ -63,7 +64,9 @@ try {
     const response = await fetch(`${base}/version`).catch(() => undefined)
     return response?.ok ?? false
   }, "Pinned relay did not start")
-  const authorization = `Bearer ${(await readFile(path.join(home, "relay-token"), "utf8")).trim()}`
+  const token = (await readFile(path.join(home, "relay-token"), "utf8")).trim()
+  sensitive.push(token)
+  const authorization = `Bearer ${token}`
   const api = async (route: string, body?: unknown): Promise<Record<string, any>> => {
     const response = await fetch(`${base}${route}`, {
       headers: { authorization, "content-type": "application/json" },
@@ -83,6 +86,7 @@ try {
   page.on("pageerror", error => pageErrors.push(error.name))
   await page.goto(`${origin}/onboarding.html`)
   const code = (await exec(binary, ["pair", "--code-only"], { env })).stdout.trim()
+  sensitive.push(code, code.replaceAll("-", ""))
   assert.ok(/^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/.test(code), "Pair command returned invalid output")
   stage = "manual pairing"
   await page.getByPlaceholder("XXXX-XXXX").fill(code)
@@ -102,7 +106,7 @@ try {
     createIfMissing: false,
     code: `await page.goto('http://127.0.0.1:${address.port}'); await page.getByLabel('Name').fill('release ready'); await page.getByRole('button', {name:'Save'}).click(); return {title:await page.title(), value:await page.locator('output').textContent()}`,
   })
-  assert.equal(result.ok, true, "Agent execute failed")
+  assert.equal(result.ok, true, typeof result.text === "string" ? result.text : "Agent execute failed")
   assert.deepEqual(result.value, { title: "Browse release fixture", value: "release ready" })
   stage = "settings"
   await page.goto(`${origin}/settings.html`)
@@ -128,8 +132,11 @@ try {
   await writeFile(path.join(path.dirname(zip), "browser-smoke.json"), JSON.stringify(report, null, 2) + "\n")
   console.log(JSON.stringify(report, null, 2))
 } catch (error) {
-  // Browser call logs may contain form values. Report the stage, never credentials or raw browser errors.
+  // Browser call logs may contain form values. Redact ephemeral fixture credentials before diagnostics.
   console.error(`Release smoke failed during ${stage} (${error instanceof Error ? error.name : "unknown error"})`)
+  let detail = error instanceof Error ? error.message : ""
+  for (const value of sensitive) if (value) detail = detail.split(value).join("[redacted]")
+  console.error(detail.slice(0, 2_000))
   process.exitCode = 1
 } finally {
   await browser?.close().catch(() => {})
