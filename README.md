@@ -1,10 +1,13 @@
 # BharatCode Browse
 
-Use a Chromium browser you already have with agents in BharatCode Desktop. The extension works through a local
-MCP relay. It keeps agent tabs separate, lets you share a tab from the toolbar, and hands control back when your
+Use a Chromium browser you already have with agents through a BharatCode Browse MCP relay. The relay runs locally
+by default, or on another computer you choose. The extension keeps agent tabs separate, lets you share a tab from the toolbar, and hands control back when your
 input is needed. BharatCode Browse is based on [Anomaly's Browse](https://github.com/anomalyco/browse).
 
 ## Desktop preview
+
+Desktop integration is proposed in [draft PR86](https://github.com/BharatCode-ai/bharatcode-desktop/pull/86), not included
+in the current stable candidate. These steps apply only to builds that bundle Browse; otherwise use the [standalone source setup](#development).
 
 1. In a BharatCode Desktop build that bundles Browse, open **Settings → General → Connect browser**.
 2. Open the extensions page in your Chromium browser, enable **Developer mode**, then click **Load unpacked**.
@@ -69,11 +72,11 @@ initialize instructions. Everything is also a CLI:
   <img src="assets/how-light.png" alt="Three machines on one bench, cabled in a line: the agent's terminal calling browse.execute, the relay box in the middle, and the computer whose browser the agent drives.">
 </picture>
 
-The agent talks to the `browse` MCP server over stdio. The server hands each command to the relay on
-`127.0.0.1:19989`, and the extension, connected to the relay over a WebSocket, runs it in your browser through
+The agent talks to the `browse` MCP server over stdio. The server hands each command to the relay, which defaults to
+`127.0.0.1:19989`. The extension connects to that relay, or the remote address you choose, over a WebSocket and runs commands through
 `chrome.debugger`.
 
-- **The relay** (`cli/`) is a local Chrome DevTools endpoint backed by the extension. It keeps named sessions,
+- **The relay** (`cli/`) is a Chrome DevTools endpoint on the agent's computer, backed by the extension. It keeps named sessions,
   handoffs, recordings, network capture and a journal, and starts on demand.
 - **The extension** (`src/`) connects to the relay and runs its commands through `chrome.debugger`. It keeps agent
   tabs in collapsed groups (or their own window), closes idle ones, and shows the toolbar badge and the handoff card.
@@ -89,27 +92,32 @@ The agent talks to the `browse` MCP server over stdio. The server hands each com
 
 Permissions: `debugger`, `tabs`, `tabGroups`, `storage`, `alarms`, `offscreen` and `tabCapture` (recordings),
 `scripting` (to add the handoff script only to tabs agents use, never to every page), `webNavigation` (to keep popups
-agents open with their other tabs), `notifications` (to tell you an agent needs you while it records a tab), and access to
-all sites so agents can work wherever you ask. Nothing leaves your computer except what your agent sends to its model
-provider; see the [privacy policy](store/privacy-policy.md).
+agents open with their other tabs), `notifications` (for recording handoffs, or every handoff if configured), and access to
+all sites so agents can work wherever you ask. A remote relay receives and may store browser data on that other computer.
+Your agent may also send data to its configured model provider or other services; see the [privacy policy](store/privacy-policy.md).
 
 ## Security
 
 browse drives the browser you're signed in to, so it assumes that what an agent reads (a web page, an email)
 may try to steer it, and that other programs on your computer may try to use the relay.
 
-- **Relay token.** Every HTTP request and CDP connection to the relay needs the token in
+- **Relay token.** Agent HTTP requests and CDP connections to the relay need the token in
   `~/.local/share/browse/relay-token` (readable only by you): an `Authorization: Bearer` header, or
   `?opencodeBrowserToken=` on the CDP WebSocket URL. The MCP server and CLI read it for you. The relay listens on
-  `127.0.0.1` only and refuses cross-site browser requests and foreign `Host` headers.
+  `127.0.0.1` by default; remote operation requires explicit listener configuration. The `/` and `/version` readiness
+  probes are unauthenticated. The relay checks browser request origins and `Host` headers.
+- **Remote transport.** Extension connections use `ws://`, not TLS; entering `wss://` does not enable TLS. Pairing
+  authenticates the relay but does not encrypt browser traffic. Use a remote relay only through a secured private
+  network or tunnel. The extension does not enforce that network protection.
 - **Pairing.** `pair` prints a short code (`XXXX-XXXX`) that works once, within 10 minutes; five wrong codes in a row
   void every pending one. A browser exchanges it for a random key of its own, kept by the relay
   (`browser-tokens.json` in the data folder, readable only by you) and in the extension's storage. The exchange runs
-  over a fresh key agreement (ECDH), so neither the code nor the key crosses the connection, and each side proves it
-  knows the code before the other gives anything away. On every later connection both sides prove they hold the key
+  over a fresh key agreement (ECDH): the code is not sent in plaintext, and the key is transferred in wrapped form.
+  On every later connection both sides prove they hold the key without resending it
   (HMAC over fresh nonces) before the extension obeys anything, so a program that grabs the port first can't drive
   your browser. `pair --list` shows paired browsers and when each was last seen; `pair --revoke <browser>` deletes a
-  browser's key and disconnects it. The relay accepts the fork's unpacked extension ID, a configured store ID,
+  browser's key from the relay and disconnects it; this does not erase browser storage, journals or exports.
+  The relay accepts the fork's unpacked extension ID, a configured store ID,
   and any IDs listed in `OPENCODE_BROWSER_EXTENSION_ORIGINS`. Browsers paired by an earlier version with its shared
   code switch to a key of their own the next time they connect. Use `pair --revoke legacy` to retire that code.
 - **Restricted `execute`.** Agent code runs in a restricted JavaScript realm on the relay: it withholds Node
@@ -129,11 +137,12 @@ may try to steer it, and that other programs on your computer may try to use the
   `page.route()`, so the relay can't own it reliably. Browsing through a local proxy makes every document look like
   it came from the proxy's address, so name the hosts you need exactly.
 - **Site secrets.** `browse secrets add <name> --origin https://example.com` stores a password, key or (with
-  `--totp`) a TOTP seed, read from stdin or a hidden prompt, in `~/.local/share/browse/site-secrets/`
-  (0700/0600). An agent types it with `secrets.type(locator, "<name>")`: the relay checks the field's frame URL from
+  `--totp`) a TOTP seed, read from stdin or a hidden prompt, in `~/.local/share/browse/site-secrets/` on the relay computer
+  (JSON with 0700/0600 permissions, not application-level encryption). An agent types it with `secrets.type(locator, "<name>")`: the relay checks the field's frame URL from
   the browser's frame tree against the secret's origins (and the session's allowlist) right before it inserts the
-  value, so a cross-origin iframe or a redirect gets nothing. The value never enters the execute realm, results,
-  logs, journals or HARs. Once typed it is in the page, where page script could read it, so pair secrets with an
+  value. The secrets API returns metadata rather than the value, and known values are redacted from outputs and captures.
+  The value passes through browser automation into the allowed page, where page scripts may read or transmit it; captures
+  are not guaranteed free of sensitive data. Pair secrets with an
   allowlist (execute warns when you don't). A stored TOTP seed makes 2FA one factor; keep handing 2FA to yourself
   when you can. `secrets list` and `secrets remove` manage them.
 - **Bot challenges.** After a navigation, execute reports Cloudflare, Akamai, DataDome, PerimeterX, Imperva, AWS WAF,
@@ -142,15 +151,21 @@ may try to steer it, and that other programs on your computer may try to use the
   interactive ones to you. It never solves them.
 - **Your tabs stay yours.** Agents use only tabs they opened or you lent them. The toolbar button always takes a tab
   back; only a real click on the card or the toolbar button finishes a handoff, so a page can't fake it.
-- **Less on disk.** Session journals are private (0700/0600), redact typed passwords, codes and tokens, and are pruned
-  after 14 days (200 at most). HARs replace credentials with references; typed passwords and one-time codes are never
-  stored. Secret profiles keep values out of transcripts and artifacts, but anything that runs with them (like
+- **Less on disk.** Session journals use 0700/0600 permissions and targeted redaction of credential-looking values.
+  At startup and every six hours, the running relay prunes non-live journals inactive for more than 14 days, then the
+  oldest non-live journals toward a 200-journal limit. Live sessions are exempt. HAR exports redact recognized credentials;
+  reusable secret profiles store raw credential values on the relay computer. Saved captures and secrets have no general
+  automatic deletion deadline. Redaction is not a guarantee that outputs contain no sensitive data. Anything that runs with a secret profile (like
   `secrets_run`) can use them. `secrets_run` commands get the relay's allowlisted environment plus the profile's
-  `BC_SECRET_N` values, not the environment you started opencode with: `PATH`, `HOME`, locale, `HTTP_PROXY`,
+  `BC_SECRET_N` values, not the environment you started your agent with: `PATH`, `HOME`, locale, `HTTP_PROXY`,
   `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and `NODE_EXTRA_CA_CERTS` pass through; other
   variables (API keys included) don't.
+- **Deletion is separate from access.** Taking a tab back or revoking a pairing does not erase data already captured.
+  Removing the extension does not delete relay files. Standalone `browse uninstall` attempts to remove the addressed
+  installation's config, data, state and cache directories, not exports elsewhere or copies held by other services.
+  Clean up each relay host and Desktop-managed data separately; see the [privacy policy](store/privacy-policy.md).
 
-Escape hatches. Set them in the environment you start opencode (or your MCP client) from; the relay inherits
+Escape hatches. Set them in the environment you start your agent (or your MCP client) from; the relay inherits
 `OPENCODE_BROWSER_*` variables. Run `node cli/dist/cli.mjs relay restart` after changing them:
 
 | Variable | Effect |
