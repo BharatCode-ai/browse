@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { $ } from "bun"
-import { cp, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { capabilityProblems, checkStoreZip, readAllowlist } from "../scripts/check-artifacts"
@@ -22,7 +22,7 @@ test("store archive rejects keys, pairing data, missing runtime pages and licens
   const zip = path.join(root, "artifact.zip")
   const staging = path.join(root, "files")
   try {
-    await $`mkdir -p ${staging}`.quiet()
+    await mkdir(staging)
     const { key: _key, ...storeManifest } = manifest
     await writeFile(path.join(staging, "manifest.json"), JSON.stringify(storeManifest))
     for (const name of ["background.js", "content.js"]) await writeFile(path.join(staging, name), "/* 19989 */")

@@ -3,7 +3,7 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
 import { execFile, spawn, type ChildProcess } from "node:child_process"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import http from "node:http"
 import os from "node:os"
 import path from "node:path"
@@ -24,6 +24,7 @@ const digest = async () => createHash("sha256").update(await readFile(zip)).dige
 const originalDigest = await digest()
 let relay: ChildProcess | undefined
 let browser: BrowserContext | undefined
+let stage = "extract archive"
 const fixture = http.createServer((_request, response) => {
   response.setHeader("content-type", "text/html")
   response.end('<title>Browse release fixture</title><label>Name<input></label><button onclick="document.querySelector(\'output\').textContent=document.querySelector(\'input\').value">Save</button><output></output>')
@@ -53,6 +54,7 @@ try {
     OPENCODE_BROWSER_UPDATE_CHECK: "0",
     OPENCODE_BROWSER_MCP_DIRECT: "1",
   }
+  stage = "start pinned relay"
   const binaryVersion = (await exec(binary, ["--version"], { env })).stdout.trim()
   assert.equal(binaryVersion, manifest.version)
   // Never print or upload relay output, tokens, pairing codes or the temporary browser profile.
@@ -70,7 +72,9 @@ try {
     assert.equal(response.status, 200, route)
     return response.json()
   }
+  stage = "load archive in Chromium"
   browser = await chromium.launchPersistentContext(path.join(root, "profile"), {
+    executablePath: chromium.executablePath(),
     headless: true,
     args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
   })
@@ -79,9 +83,10 @@ try {
   page.on("pageerror", error => pageErrors.push(error.name))
   await page.goto(`${origin}/onboarding.html`)
   const code = (await exec(binary, ["pair", "--code-only"], { env })).stdout.trim()
-  assert.match(code, /^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/)
+  assert.ok(/^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/.test(code), "Pair command returned invalid output")
+  stage = "manual pairing"
   await page.getByPlaceholder("XXXX-XXXX").fill(code)
-  await page.getByRole("button", { name: "Connect", exact: true }).click()
+  await page.getByRole("button", { name: "Pair", exact: true }).click()
   await until(async () => (await api("/extension/status")).connected === true, "Store archive did not pair")
   const status = await api("/extension/status")
   assert.equal(status.version, manifest.version)
@@ -90,6 +95,7 @@ try {
   await new Promise<void>(resolve => fixture.listen(0, "127.0.0.1", resolve))
   const address = fixture.address()
   assert.ok(address && typeof address === "object")
+  stage = "agent interaction"
   await api("/cli/session/new", { id: "release-smoke" })
   const result = await api("/cli/execute", {
     sessionId: "release-smoke",
@@ -98,21 +104,33 @@ try {
   })
   assert.equal(result.ok, true, "Agent execute failed")
   assert.deepEqual(result.value, { title: "Browse release fixture", value: "release ready" })
+  stage = "settings"
   await page.goto(`${origin}/settings.html`)
   assert.ok((await page.locator("body").innerText()).length > 0)
   assert.deepEqual(pageErrors, [])
   // Reopening the same profile must authenticate with its stored browser key, not reuse the one-time code.
+  stage = "saved pairing reconnect"
   await browser.close()
+  await until(async () => (await api("/extension/status")).connected === false, "Closed browser remained connected")
   browser = await chromium.launchPersistentContext(path.join(root, "profile"), {
+    executablePath: chromium.executablePath(),
     headless: true,
     args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
   })
   await until(async () => (await api("/extension/status")).connected === true, "Saved pairing did not reconnect")
   assert.equal(await digest(), originalDigest)
-  console.log(JSON.stringify({ archiveSha256: originalDigest, extensionVersion: manifest.version, relayVersion: binaryVersion,
+  const report = { archiveSha256: originalDigest, extensionVersion: manifest.version, relayVersion: binaryVersion,
+    relayExecutableSha256: createHash("sha256").update(await readFile(binary)).digest("hex"),
+    minimumChromeVersion: manifest.minimum_chrome_version,
     protocol: status.protocolVersion, browserVersion: browser.browser()?.version(),
     checks: ["keyless archive", "manual pairing", "agent navigation/fill/click/read", "settings", "saved pairing reconnect"],
-    identity: "temporary path-derived ID explicitly configured in pinned relay; not a store-assigned ID" }, null, 2))
+    identity: "temporary path-derived ID explicitly configured in pinned relay; not a store-assigned ID" }
+  await writeFile(path.join(path.dirname(zip), "browser-smoke.json"), JSON.stringify(report, null, 2) + "\n")
+  console.log(JSON.stringify(report, null, 2))
+} catch (error) {
+  // Browser call logs may contain form values. Report the stage, never credentials or raw browser errors.
+  console.error(`Release smoke failed during ${stage} (${error instanceof Error ? error.name : "unknown error"})`)
+  process.exitCode = 1
 } finally {
   await browser?.close().catch(() => {})
   if (relay && relay.exitCode === null && relay.signalCode === null) {

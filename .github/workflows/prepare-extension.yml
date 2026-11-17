@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: prepare-extension-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   extension:
     runs-on: ubuntu-24.04
@@ -103,3 +107,13 @@ jobs:
       - name: Smoke exact store archive against pinned native relay
         run: node --no-warnings test/release-browser.ts ../release/browse-extension-0.0.14.zip ../.relay-compat/cli/dist-bin/browse-linux-x64-baseline/bin/browse
         working-directory: cli
+      - name: Record relay source
+        run: git -C .relay-compat rev-parse HEAD > release/RELAY_SOURCE_SHA
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: browse-compatibility-${{ github.sha }}
+          path: |
+            release/browser-smoke.json
+            release/RELAY_SOURCE_SHA
+          if-no-files-found: error
+          retention-days: 30
