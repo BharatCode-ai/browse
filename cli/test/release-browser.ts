@@ -106,7 +106,7 @@ try {
     createIfMissing: false,
     code: `await page.goto('http://127.0.0.1:${address.port}'); await page.getByLabel('Name').fill('release ready'); await page.getByRole('button', {name:'Save'}).click(); return {title:await page.title(), value:await page.locator('output').textContent()}`,
   })
-  assert.equal(result.ok, true, typeof result.text === "string" ? result.text : "Agent execute failed")
+  assert.equal(result.isError, false, typeof result.text === "string" ? result.text : "Agent execute failed")
   assert.deepEqual(result.value, { title: "Browse release fixture", value: "release ready" })
   stage = "settings"
   await page.goto(`${origin}/settings.html`)
