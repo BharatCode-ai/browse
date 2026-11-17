@@ -21,6 +21,7 @@ await $`bun run build`.cwd(root).env({ ...process.env, OPENCODE_BROWSER_BUILD: b
 await rm(staging, { recursive: true, force: true })
 await mkdir(staging, { recursive: true })
 await cp(path.join(root, "dist"), staging, { recursive: true })
+await cp(path.join(root, "LICENSE"), path.join(staging, "LICENSE.txt"))
 const manifest = await Bun.file(path.join(staging, "manifest.json")).json()
 if (!dev) delete manifest.key
 applyManifestVersion(manifest, version)

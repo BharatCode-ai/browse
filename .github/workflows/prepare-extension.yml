@@ -62,3 +62,44 @@ jobs:
         working-directory: cli
       - run: bun test
         working-directory: cli
+
+  browser:
+    needs: extension
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: browse-extension-${{ github.sha }}
+          path: release
+      - run: sha256sum --check SHA256SUMS
+        working-directory: release
+      - run: bun install --frozen-lockfile
+        working-directory: cli
+      - name: Check out the relay pinned by Desktop PR86
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: BharatCode-ai/browse
+          ref: 5ef871cf6dd17f44a12be89774950e73b28118bc
+          path: .relay-compat
+          persist-credentials: false
+      - run: bun install --frozen-lockfile
+        working-directory: .relay-compat/cli
+      - run: bun script/compile.ts linux-x64-baseline
+        working-directory: .relay-compat/cli
+      - name: Install test Chromium (hosted runner only)
+        run: node node_modules/patchright-core/cli.js install --with-deps --no-shell chromium
+        working-directory: cli
+      - name: Smoke exact store archive against pinned native relay
+        run: node --no-warnings test/release-browser.ts ../release/browse-extension-0.0.14.zip ../.relay-compat/cli/dist-bin/browse-linux-x64-baseline/bin/browse
+        working-directory: cli

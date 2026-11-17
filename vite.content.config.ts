@@ -1,5 +1,6 @@
 import { defineConfig } from "vite"
 import { fileURLToPath } from "node:url"
+import manifest from "./public/manifest.json"
 
 // Content scripts are classic scripts and cannot import modules, so the page-status script builds on its
 // own as a single IIFE next to the main build's output.
@@ -9,7 +10,7 @@ export default defineConfig(({ mode }) => ({
   build: {
     outDir: "dist",
     emptyOutDir: false,
-    target: "chrome130",
+    target: `chrome${manifest.minimum_chrome_version}`,
     minify: mode !== "development",
     sourcemap: mode === "development" ? "inline" : false,
     lib: {

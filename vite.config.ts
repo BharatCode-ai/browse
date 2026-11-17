@@ -1,6 +1,7 @@
 import { defineConfig } from "vite"
 import solid from "vite-plugin-solid"
 import { fileURLToPath } from "node:url"
+import manifest from "./public/manifest.json"
 
 // The extension is loaded unpacked from dist/. The service worker must keep a stable name for the
 // manifest; everything else is content-hashed.
@@ -22,7 +23,7 @@ export default defineConfig(({ mode }) => ({
   build: {
     outDir: "dist",
     emptyOutDir: true,
-    target: "chrome130",
+    target: `chrome${manifest.minimum_chrome_version}`,
     minify: mode !== "development",
     sourcemap: mode === "development" ? "inline" : false,
     modulePreload: false,
