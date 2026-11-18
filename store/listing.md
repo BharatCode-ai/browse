@@ -19,7 +19,9 @@ BharatCode Browse lets your agent use your real browser through a paired Browse 
 - Hand off when it's your turn: logins, 2FA, passkeys, and payments stay with you, then the agent continues.
 - Agents use Playwright, take screenshots, capture network traffic, and record the tab when you ask. Recordings capture the tab, with optional tab audio.
 
-Requires a compatible BharatCode Browse relay; see the [standalone source setup instructions](https://github.com/BharatCode-ai/browse#development). Desktop integration is proposed in [draft PR86](https://github.com/BharatCode-ai/bharatcode-desktop/pull/86) and is not included in the current stable candidate. Desktop pairing instructions apply only to builds that bundle Browse. Run `browse pair` with the built relay and enter its one-time code on the extension's setup page. Pairing gives this browser a key used to authenticate later connections.
+Use BharatCode Desktop 1.15.52 or later, which includes the Browse relay. In Desktop, open Settings → General → Connect browser. Enter its one-time code on the extension's setup page, then click Check connection in Desktop. Download Desktop at https://bharatcode.ai/setup.
+
+For a standalone relay, follow the [source setup instructions](https://github.com/BharatCode-ai/browse#development), run `browse pair`, and enter the code on the extension's setup page. Pairing gives this browser a key used to authenticate later connections.
 
 The relay is on your computer by default. You can choose a remote relay, in which case browser data is processed and may be stored on that other computer. Your agent may also send data to its configured model provider. The extension itself does not choose a model provider or upload telemetry to a vendor endpoint.
 
@@ -45,4 +47,6 @@ Let a user's agent work in browser tabs it opens or the user shares, through a p
 
 **Data usage:** Disclose website content and user activity, requested recordings, and the pairing, settings and diagnostic data described in the [privacy policy](privacy-policy.md). Include optional remote-relay processing and onward processing by the agent/model provider. Confirm the dashboard's categories and certifications against the publisher's actual practices before submission; do not describe this as local-only processing.
 
-**Privacy policy URL:** Publish [privacy-policy.md](privacy-policy.md) at a stable public URL controlled by the BharatCode publisher, then enter that actual URL in the dashboard. No hosted policy URL or store ID is assigned by this preparation.
+**Privacy policy URL:** https://github.com/BharatCode-ai/browse/blob/3e8f2915ab382c2afa5f15fbaf5ca7f35a3c8d0c/store/privacy-policy.md
+
+**Existing draft item ID:** `hnibngjhajnicjcbdjggjepamojhkjjh`. Reuse its verified 0.0.14 ZIP; do not create a second listing.

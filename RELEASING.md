@@ -1,9 +1,12 @@
 # Browse releases
 
-Browse integration is currently proposed in Desktop draft PR86. Its candidate workflow
-builds the relay and extension from a pinned commit in
-[the organization Browse repository](https://github.com/BharatCode-ai/browse).
-Port the source before pointing a candidate at that commit.
+## Current release state (2026-11-19 IST)
+
+Desktop 1.15.52 stable is published with the bundled Browse relay and extension. Its candidate workflow builds them
+from a pinned commit in [the organization Browse repository](https://github.com/BharatCode-ai/browse), with the owned
+Chrome store ID configured. The store's existing 0.0.14 draft is not yet published. Reuse the verified ZIP below;
+documentation updates do not require another extension build. Exact store-ID native smoke passed, but the store
+installation/update path and complete installed-Desktop pairing acceptance remain unconfirmed.
 
 For a local build, use the Bun version in `package.json` and install the root and
 `cli` dependencies with `--frozen-lockfile`. Run `bun run build` from the root
@@ -15,7 +18,7 @@ archive. It writes the archive and its SHA-256 digest under `release/`. Stable
 archives omit the unpacked extension key. Desktop candidates use the unpacked
 build from `dist/` for local development and preview use.
 
-A future store release needs a BharatCode-owned listing. Set the Desktop
+The BharatCode-owned draft item is `hnibngjhajnicjcbdjggjepamojhkjjh`. Set the Desktop
 repository's `BROWSE_CHROME_STORE_ID` variable to the listing's extension ID
 before building a candidate for it. Test the extension against the currently
 supported Desktop relay versions before releasing the extension.
@@ -38,8 +41,8 @@ and form interaction, settings, and reconnect using the saved browser key.
 version. The test explicitly authorizes the temporary unpacked path-derived ID;
 this does not certify a future store-assigned ID or a Desktop installer.
 
-The successful Desktop candidate at `bb25eddcf8343376a81602d407d69ed26582eef8`
-(run `44074220785`) has no Browse integration. It cannot pair with this extension
+Historical preparation note: the earlier Desktop candidate at `bb25eddcf8343376a81602d407d69ed26582eef8`
+(run `44074220785`) had no Browse integration. It cannot pair with this extension
 out of the box. Before store rollout, obtain the owned store ID, configure it for
 a Browse-enabled Desktop build, and test that exact Desktop/extension combination.
 Do not work around this by accepting arbitrary extension origins. Listing and

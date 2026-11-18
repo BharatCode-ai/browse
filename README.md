@@ -4,20 +4,20 @@ Use a Chromium browser you already have with agents through a BharatCode Browse 
 by default, or on another computer you choose. The extension keeps agent tabs separate, lets you share a tab from the toolbar, and hands control back when your
 input is needed. BharatCode Browse is based on [Anomaly's Browse](https://github.com/anomalyco/browse).
 
-## Desktop preview
+## Desktop setup
 
-Desktop integration is proposed in [draft PR86](https://github.com/BharatCode-ai/bharatcode-desktop/pull/86), not included
-in the current stable candidate. These steps apply only to builds that bundle Browse; otherwise use the [standalone source setup](#development).
+Browse is bundled with [BharatCode Desktop 1.15.52](https://bharatcode.ai/setup). The Chrome Web Store listing is still a draft;
+until it is approved, use the bundled unpacked extension as described below. You can also use the [standalone source setup](#development).
 
-1. In a BharatCode Desktop build that bundles Browse, open **Settings → General → Connect browser**.
+1. In BharatCode Desktop 1.15.52 or later, open **Settings → General → Connect browser**.
 2. Open the extensions page in your Chromium browser, enable **Developer mode**, then click **Load unpacked**.
    Select the extension folder shown in Desktop.
 3. Enter the one-time code from Desktop on the extension's setup page, then click **Check connection** in Desktop.
 4. Ask the local agent to open a page and report its title. Click the extension's toolbar button to share a tab
    you already have open.
 
-The preview uses a separate extension identity, relay port, and Desktop-managed data directory. It is intended
-for Desktop's bundled local runtime. The browser installation step uses Chromium's unpacked extension workflow.
+The bundled unpacked extension has a separate identity from the store listing. Desktop keeps its Browse data in a
+Desktop-managed directory and uses the local relay at `127.0.0.1:19989`. The browser installation step above uses Chromium's unpacked extension workflow.
 
 ## Development
 
