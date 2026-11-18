@@ -11,6 +11,10 @@ Let your BharatCode agents use your browser: open and drive tabs, take screensho
 
 **Category:** Developer Tools
 
+**Language:** English
+
+**Store icon:** `public/icons/icon-128.png` (128 x 128 PNG)
+
 **Description:**
 BharatCode Browse lets your agent use your real browser through a paired Browse relay. It is based on [Anomaly's Browse](https://github.com/anomalyco/browse).
 
@@ -34,10 +38,12 @@ Let a user's agent work in browser tabs it opens or the user shares, through a p
 
 **Permission justifications:**
 - `debugger`: Lets the user's agent drive tabs it opened or the user shared (click, type, navigate, screenshot, read the page), the same as browser automation tools. The toolbar badge shows which tabs are in use.
-- `tabs`, `tabGroups`: Open and list tabs for the agent, and group the agent's tabs so the user can see them.
+- `tabs`: Open and manage tabs requested by the user's agent, and identify tabs the user shares through the toolbar. Tab titles and URLs let the agent work in the correct tab.
+- `tabGroups`: Group agent-controlled tabs so the user can identify them and keep them separate from other browsing. The user can choose grouping behavior in settings.
 - `storage`: Remember agent tabs and groups, user settings, relay addresses, browser identity and per-relay pairing keys. Also retain up to 20 spent pairing codes and a bounded session diagnostic log.
 - `alarms`: Keep the connection to the selected local or remote Browse relay alive, reconnect, and close agent tabs left idle.
-- `offscreen`, `tabCapture`: Record a tab when the user asks an agent for a screen recording.
+- `offscreen`: Run the offscreen document that manages a requested tab recording while the extension service worker is inactive. It is used for recording, not background browsing or tracking.
+- `tabCapture`: Capture video and optional tab audio when the user asks an agent to record a tab. It does not capture the desktop or other applications.
 - `scripting`: Add the extension's handoff card only to tabs agents use (not to every page), so the user can finish a login or payment step and hand the tab back.
 - `webNavigation`: Notice when an agent's click opens a new tab or popup, so it joins the agent's tab group (and the agent's own window, if the user chose one), the user's current tab stays in front, and it closes with the agent's other tabs.
 - `notifications`: Tell the user an agent needs them while it records a tab, or on every handoff if the user chose that setting. Clicking the notification shows the tab. If a notification cannot be shown, the in-page card may appear in the recording. Used for nothing else.
@@ -50,3 +56,16 @@ Let a user's agent work in browser tabs it opens or the user shares, through a p
 **Privacy policy URL:** https://github.com/BharatCode-ai/browse/blob/3e8f2915ab382c2afa5f15fbaf5ca7f35a3c8d0c/store/privacy-policy.md
 
 **Existing draft item ID:** `hnibngjhajnicjcbdjggjepamojhkjjh`. Reuse its verified 0.0.14 ZIP; do not create a second listing.
+
+## Dashboard completion checklist
+
+The November 19 dashboard screenshot confirms the existing 0.0.14 package is uploaded, but the listing has not been submitted for review.
+
+1. Store listing: paste the description above, choose English and Developer Tools, upload the 128 x 128 icon, and add at least one genuine screenshot or video of Browse. Use an actual extension screen without pairing codes, credentials or private browsing content; do not substitute a dashboard screenshot or mockup.
+2. Privacy practices: paste the single purpose and each of the eleven permission justifications above into its matching field. Remote code: No. Add the privacy-policy URL above.
+3. Review the data-use categories against the policy and the actual dashboard labels. Browse handles page content, requested recordings, browsing actions/URLs and authentication/pairing information; do not declare that it handles no data merely because the relay is local.
+4. The publisher must review the displayed data-use certifications against its practices before checking them.
+5. Publisher Settings: enter the intended contact email and finish Google's email verification. Do not change the publisher login or payment details.
+6. Save Draft on each edited page. Return to Status and resolve any remaining warnings before Submit for review. A submitted review is not the same as a published listing.
+
+Google guidance: https://developer.chrome.com/docs/webstore/program-policies/user-data-faq
