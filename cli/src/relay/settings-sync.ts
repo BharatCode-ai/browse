@@ -1,8 +1,7 @@
 import { Effect } from "effect"
-import { autoUpdateOverride, autoUpdateStatus, storedMode } from "../update/local-runtime.ts"
+import { autoUpdateModes, autoUpdateOverride, autoUpdateStatus, setStoredMode, storedMode, type AutoUpdateMode } from "../update/auto-update.ts"
 import type { BrowserLink, BrowserLinks } from "./browser-links.ts"
 import type { ExtensionCommandInput } from "./rpc.ts"
-import type { GhostCursorTabs } from "../ghost-cursor.ts"
 import { humanInputEnabled, humanInputOverride } from "../execute/human-input.ts"
 import { installCommand } from "../paths.ts"
 import type { JsonObject } from "../protocol.ts"
@@ -23,13 +22,11 @@ import type { ExtensionHandshake } from "./extension-handshake.ts"
 export function createRelaySettingsSync(options: {
   readonly browsers: BrowserLinks
   readonly handshake: ExtensionHandshake
-  readonly ghostCursor: GhostCursorTabs
-  readonly ghostCursorEnv: boolean | undefined
   readonly agentWindow: "current" | "separate" | undefined
   readonly sendToExtension: (command: ExtensionCommandInput, link?: BrowserLink) => Effect.Effect<JsonObject, Error>
   readonly sendExtensionBestEffort: (command: ExtensionCommandInput, link?: BrowserLink) => void
 }) {
-  const { browsers, handshake, ghostCursor, ghostCursorEnv, agentWindow, sendToExtension, sendExtensionBestEffort } = options
+  const { browsers, handshake, agentWindow, sendToExtension, sendExtensionBestEffort } = options
 
   /** The extension's settings with the relay's own (autoUpdate) filled in from the data root. */
   const withRelaySettings = (settings: Settings): Settings => ({ ...settings, autoUpdate: storedMode() })
@@ -39,9 +36,8 @@ export function createRelaySettingsSync(options: {
     const human = humanInputOverride()
     const autoUpdate = autoUpdateOverride()
     return {
-      ...(autoUpdate ? { autoUpdate: { variable: "BharatCode Desktop", value: autoUpdate } } : {}),
+      ...(autoUpdate ? { autoUpdate: { variable: process.env.OPENCODE_BROWSER_AUTO_UPDATE !== undefined ? "OPENCODE_BROWSER_AUTO_UPDATE" : "OPENCODE_BROWSER_UPDATE_CHECK", value: autoUpdate } } : {}),
       ...(agentWindow ? { window: { variable: "OPENCODE_BROWSER_AGENT_WINDOW", value: agentWindow } } : {}),
-      ...(ghostCursorEnv === undefined ? {} : { cursor: { variable: "OPENCODE_BROWSER_GHOST_CURSOR", value: ghostCursorEnv ? "always" : "off" } }),
       ...(human === undefined ? {} : { humanInput: { variable: "OPENCODE_BROWSER_HUMAN_INPUT", value: human ? "on" : "off" } }),
     }
   }
@@ -54,7 +50,7 @@ export function createRelaySettingsSync(options: {
         return yield* Effect.fail(new Error(rejected ? handshake.mismatchAdvice(rejected.version) : "The browse extension isn't connected, so its settings can't be read or changed. Ask the user to open the browser with the extension; its options page shows whether it's connected."))
       }
       const result = yield* sendToExtension({ method, ...(values ? { params: { values } } : {}) }).pipe(
-        Effect.mapError((error) => /Invalid extension command/.test(error.message)
+        Effect.mapError((error) => /Invalid extension command|Unknown setting/.test(error.message)
           ? new Error(`The connected browse extension is too old to read or change settings from here. Update browse (\`${installCommand()}\`) and reload the extension, or change them on its options page.`)
           : error),
       )
@@ -66,15 +62,14 @@ export function createRelaySettingsSync(options: {
     const human = humanInputOverride()
     return {
       ...(agentWindow ? { agentWindow } : {}),
-      ...(ghostCursorEnv === undefined ? {} : { cursor: ghostCursorEnv ? "always" : "off" }),
       ...(human === undefined ? {} : { humanInput: human ? "on" : "off" }),
     }
   }
 
   /** What the status pages show from the relay: the settings its environment fixes, and the update state. */
-  const sendRelaySettings = (): void => {
+  const sendRelaySettings = (only?: BrowserLink): void => {
     for (const link of browsers.list()) {
-      if (!link.rpc.connected) continue
+      if ((only && link !== only) || !link.rpc.connected) continue
       sendExtensionBestEffort({
         method: "relay.settings",
         params: { overrides: settingOverrides(), autoUpdate: autoUpdateStatus() as unknown as JsonObject, browser: { id: link.id, name: link.name } },
@@ -88,13 +83,23 @@ export function createRelaySettingsSync(options: {
    * the status page which settings the environment fixes.
    */
   const applyExtensionSettings = (link: BrowserLink, params: JsonObject | undefined): void => {
-    const cursor = params?.cursor
-    if (cursor === "off" || cursor === "always") link.cursor = cursor === "always"
     const human = params?.humanInput
     if (human === "on" || human === "off") link.humanInput = human === "on"
-    relayLog("extension.settings", { browser: link.id, cursor: (ghostCursorEnv ?? link.cursor) ? "always" : "off", humanInput: humanInputEnabled(link.humanInput) ? "on" : "off" })
-    void ghostCursor.refresh()
-    sendRelaySettings()
+    const autoUpdate = params?.autoUpdate
+    if (typeof autoUpdate === "string" && (autoUpdateModes as readonly string[]).includes(autoUpdate)) {
+      setStoredMode(autoUpdate as AutoUpdateMode)
+      relayLog("autoupdate.mode", { mode: autoUpdate })
+    }
+    relayLog("extension.settings", { browser: link.id, humanInput: humanInputEnabled(link.humanInput) ? "on" : "off" })
+    if (link.rpc.connected) sendRelaySettings()
+    else link.pendingRelaySettings = true
+  }
+
+  /** Sends the settings answer an extension asked for after pairing, once the relay is ready enough to deliver it. */
+  const relaySettingsReady = (link: BrowserLink): void => {
+    if (!link.pendingRelaySettings) return
+    link.pendingRelaySettings = false
+    sendRelaySettings(link)
   }
 
   const httpSettings = {
@@ -113,7 +118,9 @@ export function createRelaySettingsSync(options: {
       const relayOnly = Object.keys(extensionChanges).length === 0
       const fromExtension = relayOnly && !browsers.connected ? undefined : yield* extensionSettings("settings.get")
       const before = withRelaySettings(fromExtension ?? settingsFromExtension({ settings: {} }))
+      if (typeof writable.autoUpdate === "string") setStoredMode(writable.autoUpdate as AutoUpdateMode)
       const after = withRelaySettings(Object.keys(extensionChanges).length ? yield* extensionSettings("settings.set", extensionChanges) : (fromExtension ?? before))
+      if (writable.autoUpdate !== undefined) sendRelaySettings()
       relayLog("settings.set", { changes: Object.keys(writable).join(",") || undefined, overridden: Object.keys(requested).filter((key) => key in overrides).join(",") || undefined })
       return describeChanges({ before, after, requested, overrides })
     }),
@@ -121,6 +128,7 @@ export function createRelaySettingsSync(options: {
 
   return {
     applyExtensionSettings,
+    relaySettingsReady,
     sendRelaySettings,
     httpSettings,
   }

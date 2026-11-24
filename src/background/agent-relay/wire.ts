@@ -1,5 +1,5 @@
-import { defaultRelayPort, isJsonObject, type JsonObject } from "../../agent-relay/protocol"
-import { autoUpdateMode, BROWSER_NAME_KEY, type RelayAutoUpdate } from "../../shared/protocol"
+import { isJsonObject, type JsonObject } from "../../agent-relay/protocol"
+import { autoUpdateMode, BROWSER_NAME_KEY, relayInstallMethods, type RelayAutoUpdate, type RelayUpdateFailure } from "../../shared/protocol"
 import type { createAgentRelayLog } from "./log"
 import type { ecdhKeyPair, PairingCode } from "../pairing"
 
@@ -21,8 +21,16 @@ export type Handshake = {
   session?: { key: Uint8Array; relayNonce: string }
 }
 
-/** Overrides the relay port, for development and isolated tests. */
+/** Overrides the relay port, for development and isolated tests. An automatic connection never scans with it set. */
 export const PORT_KEY = "agentRelayPort"
+/** chrome.storage.local: the port an automatic connection currently dials (a pairing hint, a scan, or the default). */
+export const DISCOVERED_PORT_KEY = "agentRelayDiscoveredPort"
+/** chrome.storage.local: how that port was found, "hint" (link, file, typed address) or "scan". Missing reads as scan. */
+export const DISCOVERED_KIND_KEY = "agentRelayDiscoveredKind"
+/** chrome.storage.local: the port whose relay completed its HMAC proof here; only that makes a scanned port trusted. */
+export const PROVEN_PORT_KEY = "agentRelayProvenPort"
+/** chrome.storage.local: the port a pending pairing code was given for; it is never sent to another one. */
+export const CODE_PORT_KEY = "agentRelayCodePort"
 export const PROFILE_KEY = "agentRelayProfile"
 /** chrome.storage.local: each agent session's tab group, so a worker restart keeps a session's tabs in one group. */
 export const SESSION_GROUPS_KEY = "agentSessionGroups"
@@ -52,6 +60,16 @@ export const CONNECT_TIMEOUT = 10_000
 export const KEEPALIVE = 20_000
 export const BACKOFF_BASE = 500
 export const BACKOFF_CAP = 15_000
+/** A never-opened socket usually means nothing is listening (or the upgrade was refused or timed out); retries are
+ * cheap, and the 30 s reconnect alarm still governs a suspended worker. */
+export const BACKOFF_CAP_UNOPENED = 3_000
+
+/** The wait before the next attempt: jittered, and shorter when the last socket never opened. */
+export function retryDelay(attempt: number, opened: boolean, random = Math.random()): number {
+  const base = Math.min(opened ? BACKOFF_CAP : BACKOFF_CAP_UNOPENED, BACKOFF_BASE * 2 ** attempt)
+  return Math.round(base * (0.75 + random * 0.5))
+}
+
 /** A connection that lasted this long was healthy; the next failure starts the backoff over. */
 export const STABLE_AFTER = 5_000
 /** CDP commands are frequent; only slow or failed ones go to the log. */
@@ -60,7 +78,6 @@ export const SLOW_CDP = 2_000
 // drop the debugger; evicting the frame and re-attaching recovers.
 export const FOREIGN_FRAME = /Cannot access a chrome-extension:\/\/ URL|Debugger is not attached to the tab/i
 export const ATTACHED_TITLE = "browse · Agents can use this tab. Click to stop."
-export const DEFAULT_PORT = defaultRelayPort
 
 export const CLOSE_CODES: Record<number, string> = {
   1000: "normal",
@@ -145,6 +162,20 @@ export function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+export const TIMED_OUT = Symbol("timed out")
+/** `work`'s value, or TIMED_OUT after `ms`: a browser call that never settles must not hold an answer. */
+export async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), Math.max(0, ms))
+  })
+  try {
+    return await Promise.race([work, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export function text(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -161,22 +192,45 @@ export function string(params: JsonObject | undefined, key: string) {
   return value
 }
 
+/** The relay's last failed installer attempt, keeping only known fields and values. */
+function relayUpdateFailure(input: unknown): RelayUpdateFailure | undefined {
+  if (!isJsonObject(input) || typeof input.message !== "string" || typeof input.at !== "string") return undefined
+  const version = typeof input.version === "string" && input.version.length <= 100 ? input.version : undefined
+  const attempts = typeof input.attempts === "number" && Number.isSafeInteger(input.attempts) && input.attempts > 0 ? input.attempts : undefined
+  return { message: input.message.slice(0, 300), at: input.at.slice(0, 100), ...(version ? { version } : {}), ...(attempts ? { attempts } : {}) }
+}
+
 /** The relay's update state from `relay.settings`, keeping only known fields and values. */
 export function relayAutoUpdate(input: unknown): RelayAutoUpdate | undefined {
   if (!isJsonObject(input)) return undefined
-  const install = input.install === "npm" || input.install === "checkout" ? input.install : "other"
+  const install =
+    input.install === "binary" || input.install === "npm" || input.install === "npx" || input.install === "checkout"
+      ? input.install
+      : "other"
   const mode = autoUpdateMode(input.mode)
   const effective = autoUpdateMode(input.effective)
   if (!mode || !effective) return undefined
-  const short = (value: unknown) => (typeof value === "string" && value.length <= 100 ? value : undefined)
+  const short = (value: unknown, max = 100) => (typeof value === "string" && value.length <= max ? value : undefined)
+  const method = relayInstallMethods.find((known) => known === input.method)
   const optional = {
+    method,
+    updateCommand: short(input.updateCommand, 500),
     cli: short(input.cli),
     overriddenBy: short(input.overriddenBy),
     version: short(input.version),
     channel: short(input.channel),
     latest: short(input.latest),
+    latestAt: short(input.latestAt),
+    checkedAt: short(input.checkedAt),
     pending: short(input.pending),
     previous: short(input.previous),
   }
-  return { install, mode, effective, ...Object.fromEntries(Object.entries(optional).filter(([, value]) => value !== undefined)) }
+  const lastError = relayUpdateFailure(input.lastError)
+  return {
+    install,
+    mode,
+    effective,
+    ...Object.fromEntries(Object.entries(optional).filter(([, value]) => value !== undefined)),
+    ...(lastError ? { lastError } : {}),
+  }
 }

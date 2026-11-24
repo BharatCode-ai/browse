@@ -1,24 +1,21 @@
 // The link to the browse relay (ws://127.0.0.1:19989/extension). The relay runs agent sessions
-// for the browse MCP server and the browse CLI (Playwright `execute`, recordings, handoffs) and drives tabs
+// for the browse MCP server and the browse CLI (page tools, `execute` scripts, recordings, handoffs) and drives tabs
 // through this extension; this module runs its commands. The wire protocol is in ../agent-relay/protocol.ts,
 // the relay itself in cli/src/relay.ts.
 import { checkoutReloadPrefix, extensionProtocolVersion, unpackedExtensionId } from "../../cli/src/protocol"
 import {
   defaultRelayPort,
-  encodeRecordingFrame,
   extensionReconnectAlarmPeriodMs,
   isJsonObject,
   type JsonObject,
   type PageStatus,
 } from "../agent-relay/protocol"
-import type { OffscreenOutgoingMessage } from "../agent-relay/recording-types"
 import {
-  AGENT_CURSOR_KEY,
-  agentCursor,
   HUMAN_INPUT_KEY,
+  MUTE_TABS_KEY,
   humanInput,
+  muteTabs,
   RELAY_ADDRESS_KEY,
-  relayAddress,
   type AgentRelayState,
   type AgentRelayStatus,
   type AgentRelayUpdate,
@@ -31,30 +28,41 @@ import { createAgentRelayLog, formatAgentRelayLog } from "./agent-relay/log"
 import { AgentGroups } from "./agent-relay/groups"
 import { createRelayCommands } from "./agent-relay/commands"
 import { createRelayDebugger } from "./agent-relay/debugger"
+import { createRelayDiscovery, relayTarget } from "./agent-relay/discovery"
+import { defaultDiscovered, discoveredKeys, discoveredRelay, isDeliberateClose, provenDiscovered, shownRelayPort } from "./agent-relay/discovered"
 import { createRelayGrouping } from "./agent-relay/grouping"
 import { createRelayHandshake } from "./agent-relay/handshake"
 import {
   ALARM,
-  BACKOFF_BASE,
-  BACKOFF_CAP,
   CLOSE_CODES,
   CONNECT_TIMEOUT,
   KEEPALIVE,
   PORT_KEY,
+  retryDelay,
   serialize,
   STABLE_AFTER,
   text,
   type AgentBadge,
 } from "./agent-relay/wire"
 import { installPopupAdoption } from "./agent-relay/popups"
-import { createRelayRecording } from "./agent-relay/recording"
 import { DebuggerHub } from "./debugger-hub"
+import { DebuggingBarNotice } from "./debugging-bar-notice"
 import { HandoffNotice } from "./handoff-notice"
 import { TabCleanup } from "./tab-cleanup"
+import { ToolbarNotice } from "./toolbar-notice"
 
 export type { AgentBadge }
 
 declare const __OPENCODE_BROWSER_BUILD__: string
+
+/**
+ * chrome.storage.session: the toolbar clicks waiting for a relay, as `{ tabId, lending }` (see createAgentRelay). A
+ * worker stop would otherwise lose them; a browser restart or an extension reload clears session storage.
+ */
+const PENDING_KEY = "agentRelayPendingClicks"
+type PendingClick = { tabId: number; lending: boolean }
+const pendingClick = (value: unknown): value is PendingClick =>
+  isJsonObject(value) && typeof value.tabId === "number" && typeof value.lending === "boolean"
 
 export function createAgentRelay(input: { changed: (state: AgentRelayState) => void; badgesChanged: () => void }) {
   const log = createAgentRelayLog()
@@ -64,6 +72,10 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
   let status: AgentRelayStatus = "offline"
   let host = "127.0.0.1"
   let port = defaultRelayPort
+  /** No address set and no dev pin: the relay may move to a fallback port, and a failed connection may scan for it. */
+  let automatic = true
+  /** How the current automatic port was learned, and whether a connection on it ever authenticated. */
+  let discovered = defaultDiscovered
   let attempts = 0
   let retry: ReturnType<typeof setTimeout> | undefined
   let keepalive: ReturnType<typeof setInterval> | undefined
@@ -71,12 +83,76 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
   const cdp = { count: 0, errors: 0 }
   const relayTabs = new Set<number>()
   let reloading = false
-  /** Tabs with a recording in progress; cleanup leaves them open. */
-  const recordingTabs = new Set<number>()
   const pageStatuses = new Map<number, PageStatus>()
   const badges = new Map<number, AgentBadge>()
-  /** Tabs the user let agents use while the relay was not connected; announced once it is. */
-  const pendingAttach = new Set<number>()
+  /** Tabs clicked while the relay was not connected; the value says the click was a lend. Announced once it is. */
+  const pendingAttach = new Map<number, boolean>()
+  /** Tabs closed while the stored queue loaded; a `tabs.get` answer that came first must not queue them. */
+  let closedWhileRestoring: Set<number> | undefined
+  /** Writes run in order and each carries the queue as it is when it runs, so an older list can't land last. */
+  let pendingWrites: Promise<unknown> = Promise.resolve()
+  const savePending = () => {
+    pendingWrites = pendingWrites
+      .then(() => {
+        if (!pendingAttach.size) return chrome.storage.session.remove(PENDING_KEY)
+        const list = Array.from(pendingAttach, ([tabId, lending]) => ({ tabId, lending }))
+        return chrome.storage.session.set({ [PENDING_KEY]: list })
+      })
+      .catch(() => undefined)
+  }
+  /** Takes a queued click back: the tab goes back to what it was, badge and storage included. */
+  const cancelPending = (tabId: number) => {
+    if (!pendingAttach.delete(tabId)) return false
+    savePending()
+    input.badgesChanged()
+    return true
+  }
+  /** Relays in these states send every toolbar click to the setup page, so a queued one could never be taken back. */
+  const unusable = (state: AgentRelayStatus) =>
+    state === "unpaired" || state === "untrusted" || state === "incompatible"
+  /** Empties the queue: its badges go, and the next click opens the setup page rather than queueing again. */
+  const dropNow = (reason: AgentRelayStatus) => {
+    const tabs = pendingAttach.size
+    if (!tabs) return
+    pendingAttach.clear()
+    savePending()
+    input.badgesChanged()
+    log.add("attach.dropped", { reason, tabs })
+  }
+  /** The badge for a queued click: the ellipsis says browse has the tab and hasn't handed it to the relay yet. */
+  const queuedBadge = (lending: boolean): AgentBadge => ({
+    text: "…",
+    title: lending
+      ? "browse is waiting for the relay, which starts when an agent next uses browse. Click again to cancel."
+      : "browse will take this tab back when the relay connects, which happens when an agent next uses browse. Click again to cancel.",
+  })
+  /** The queue a previous worker left. attachTab and the flush wait for it, so neither acts on half a queue. */
+  const restored = (async () => {
+    const closing = (closedWhileRestoring = new Set<number>())
+    const stored = (await chrome.storage.session.get(PENDING_KEY).catch(() => ({}))) as Record<string, unknown>
+    const list = Array.isArray(stored[PENDING_KEY]) ? stored[PENDING_KEY].filter(pendingClick) : []
+    let dropped = 0
+    for (const { tabId, lending } of list) {
+      const tab = await chrome.tabs.get(tabId).catch(() => undefined)
+      // A tab closed while no worker ran isn't handed over; nor is one whose close landed while Chrome answered.
+      if (!tab || closing.has(tabId)) {
+        dropped++
+        continue
+      }
+      pendingAttach.set(tabId, lending)
+    }
+    closedWhileRestoring = undefined
+    if (dropped) savePending()
+    if (list.length) log.add("attach.restored", { queued: pendingAttach.size, ...(dropped ? { dropped } : {}) })
+    // A relay that refused this browser, or speaks another version, was found while the queue loaded: drop it.
+    if (unusable(status)) dropNow(status)
+    else if (pendingAttach.size) input.badgesChanged()
+  })()
+  /** Waits for the queue a previous worker left, then drops it if the relay still can't take it. */
+  const dropPending = async () => {
+    await restored
+    if (unusable(status)) dropNow(status)
+  }
   let update: AgentRelayUpdate | undefined
   /** Settings the connected relay's environment fixes, as it reported them (`relay.settings`). */
   let overrides: RelayOverrides | undefined
@@ -112,6 +188,7 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
 
   const snapshot = (): AgentRelayState => {
     const { pairing, skew, codeRejected, unpacked } = handshake.pairingState()
+    const shownPort = shownRelayPort(automatic, discovered, port)
     return {
       status,
       pairing,
@@ -126,7 +203,7 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
       ...(codeRejected ? { codeRejected: true } : {}),
       ...(unpacked ? { unpacked: true } : {}),
       ...(browser && status === "connected" ? { browser } : {}),
-      relay: { address: `${host === "127.0.0.1" ? "localhost" : host}:${port}`, remote: host !== "127.0.0.1" },
+      relay: { address: `${host === "127.0.0.1" ? "localhost" : host}:${shownPort}`, remote: host !== "127.0.0.1" },
     }
   }
 
@@ -135,6 +212,8 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     if (status === next) return
     log.add("status", { from: status, to: next })
     status = next
+    // Nothing can take a queued click then, and the badge would promise a handover that won't happen.
+    if (unusable(next)) void dropPending()
     notify()
   }
 
@@ -151,15 +230,78 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     const known = relayTabs.delete(tabId)
     pageStatuses.delete(tabId)
     void HandoffNotice.clear(tabId)
+    void ToolbarNotice.clear(tabId)
     if (known) notify()
+  }
+
+  /** Sends the clicks that waited for the relay; one made meanwhile waits for the next connection. */
+  const flushPending = async () => {
+    await restored
+    // Only a relay that is connected right now gets them.
+    if (!open() || status !== "connected" || !pendingAttach.size) return
+    const queued = Array.from(pendingAttach)
+    pendingAttach.clear()
+    savePending()
+    input.badgesChanged()
+    log.add("attach.flush", { tabs: queued.length })
+    for (const [tabId, lending] of queued) {
+      if (lending) ToolbarNotice.expect(tabId)
+      send({ method: "toolbar.clicked", params: { tabId } })
+    }
+  }
+
+  /**
+   * Tabs an agent opened whose debugger the user canceled. An older relay still follows the detach with `tabs.ungroup`,
+   * which must not close or ungroup them: they stay open, grouped and on the idle timer. The mark is consumed by that
+   * command, or expires so it can never swallow a later, real ungroup.
+   */
+  const canceledAgentTabs = new Set<number>()
+  const canceledAgentTabTtlMs = 10_000
+
+  /**
+   * The user dismissed the browser's debugging bar, which detaches the debugger from every tab at once. A tab the user
+   * lent goes back to them: untracked by idle cleanup and out of the agent group, but open. A tab an agent opened stays
+   * open, grouped and tracked, so idle cleanup closes it on the usual timer. The user hears about it once, not per tab.
+   */
+  const releaseCanceledTab = async (tabId: number) => {
+    void DebuggingBarNotice.canceled()
+    // A previous worker may have stored the tracking, so restore it before deciding who opened the tab. If that
+    // fails, treat it as agent-opened: leaving it open is safer than letting idle cleanup close a tab the user lent.
+    const agentOpened = await TabCleanup.isTracked(tabId).catch(() => true)
+    forget(tabId)
+    if (badges.delete(tabId)) input.badgesChanged()
+    if (agentOpened) {
+      canceledAgentTabs.add(tabId)
+      setTimeout(() => canceledAgentTabs.delete(tabId), canceledAgentTabTtlMs)
+    } else {
+      TabCleanup.forget(tabId)
+      await grouping.ungroup(tabId, { released: true }).catch((error: unknown) => {
+        log.add("debugger.release.error", { tabId, error: text(error) })
+      })
+    }
+    send({ method: "debugger.detached", params: { tabId, reason: "canceled_by_user" } })
+  }
+
+  /** Whether a `tabs.ungroup` is an older relay following a debugging-bar cancel (see canceledAgentTabs). */
+  const consumeCanceledUngroup = (tabId: number) => canceledAgentTabs.delete(tabId)
+
+  /**
+   * The user is lending this tab with the toolbar button. Stop treating it as a tab an agent opened, so idle cleanup
+   * never closes it, and drop a cancel mark so the relay's follow-up `tabs.ungroup` only takes it out of the agent
+   * group. Restore the stored tracking first: forgetting before a restore would let the stored entry come back.
+   */
+  const lendTab = async (tabId: number) => {
+    // Restore the stored tracking first: forgetting before a restore would let the stored entry come back.
+    await TabCleanup.isTracked(tabId).catch(() => undefined)
+    TabCleanup.forget(tabId)
+    canceledAgentTabs.delete(tabId)
   }
 
   // The relay-side settings apply as soon as they change; the relay answers with what its environment fixes.
   const sendSettings = async () => {
     if (!open()) return
-    const stored = await chrome.storage.local.get([AGENT_CURSOR_KEY, HUMAN_INPUT_KEY])
+    const stored = await chrome.storage.local.get([HUMAN_INPUT_KEY])
     const settings: RelaySettings = {
-      cursor: agentCursor(stored[AGENT_CURSOR_KEY]),
       humanInput: humanInput(stored[HUMAN_INPUT_KEY]),
     }
     log.add("settings", settings)
@@ -181,11 +323,6 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     send,
   })
 
-  const recording = createRelayRecording({
-    open,
-    currentSocket: () => socket,
-  })
-
   const resetAndConnect = (reason: string, closeReason?: string) => {
     attempts = 0
     clearTimeout(retry)
@@ -194,11 +331,19 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     void connect(reason)
   }
 
+  /** Finds a relay that moved to a fallback port (cli/src/relay/port.ts), instead of backing off on the wrong one. */
+  const discovery = createRelayDiscovery({
+    log,
+    current: () => ({ port, automatic }),
+    reconnect: (reason) => resetAndConnect(reason),
+  })
+
   const handshake = createRelayHandshake({
     log,
     relayTabs,
     currentSocket: () => socket,
     hostPort: () => ({ host, port }),
+    automatic: () => automatic,
     status: () => status,
     snapshot,
     generation: () => generation,
@@ -212,11 +357,13 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
         if (socket === current) send({ method: "pong" })
       }, KEEPALIVE)
       connectedAt = Date.now()
+      discovered = provenDiscovered(discovered, port)
+      discovery.noteAuthenticated()
       setStatus(skew ? "incompatible" : "connected")
       // Only the newest connection gets this far (verify checks socket === current).
       handshake.settle(generation)
-      pendingAttach.forEach((tabId) => send({ method: "toolbar.clicked", params: { tabId } }))
-      pendingAttach.clear()
+      // Clicks that waited for the relay go now that it can take them.
+      void flushPending()
       void grouping.ungroupStale().catch((error: unknown) => log.add("ungroupStale.error", { error: text(error) }))
     },
   })
@@ -225,7 +372,6 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     log,
     cdp,
     relayTabs,
-    recordingTabs,
     pageStatuses,
     badges,
     currentSocket: () => socket,
@@ -244,8 +390,7 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     sendCommand: debuggerOps.sendCommand,
     group: grouping.group,
     ungroup: grouping.ungroup,
-    startRecording: recording.startRecording,
-    recordingCall: recording.recordingCall,
+    consumeCanceledUngroup,
   })
 
   const connect = (reason: string) => {
@@ -255,11 +400,11 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     return starting
   }
 
-  /** Capped exponential backoff with jitter; the alarm keeps trying while the worker sleeps. */
-  const schedule = (quiet = false) => {
+  /** Capped exponential backoff with jitter; the alarm keeps trying while the worker sleeps. A socket that never opened
+   * costs nothing to retry, so that backoff stays short; one that opened then failed keeps the longer cap. */
+  const schedule = (quiet = false, opened = true) => {
     clearTimeout(retry)
-    const base = Math.min(BACKOFF_CAP, BACKOFF_BASE * 2 ** attempts)
-    const delay = Math.round(base * (0.75 + Math.random() * 0.5))
+    const delay = retryDelay(attempts, opened)
     attempts = Math.min(attempts + 1, 16)
     if (!quiet) log.add("retry", { ms: delay, attempt: attempts })
     retry = setTimeout(() => {
@@ -272,12 +417,16 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     if (socket && socket.readyState <= WebSocket.OPEN) return
     clearTimeout(retry)
     retry = undefined
-    const stored = await chrome.storage.local.get([PORT_KEY, RELAY_ADDRESS_KEY])
-    // A relay on another computer (the status page's relay address), else this one; an unusable value reads as unset.
-    const address = relayAddress(stored[RELAY_ADDRESS_KEY]) ?? { host: "127.0.0.1" }
+    // An unpacked build's pairing file names the relay's port when it isn't 19988 (cli/src/relay/port.ts).
+    await handshake.pairingHint()
+    const stored = await chrome.storage.local.get([PORT_KEY, RELAY_ADDRESS_KEY, ...discoveredKeys])
+    // An address the user set (or the PORT_KEY dev pin), else this one: 19988, or the port a hint or scan found.
+    const target = relayTarget(stored)
     const previous = `${host}:${port}`
-    host = address.host
-    port = address.port ?? (Number(stored[PORT_KEY]) || defaultRelayPort)
+    host = target.host
+    port = target.port
+    automatic = target.automatic
+    discovered = discoveredRelay(stored)
     if (`${host}:${port}` !== previous) notify()
     if (socket && socket.readyState <= WebSocket.OPEN) return
     // Without a credential announce only the protocol and that pairing is needed. No identity, tabs or
@@ -352,7 +501,6 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
           opened: openedAt !== undefined,
           ms: lasted,
         })
-      if (!presenceOnly) void chrome.runtime.sendMessage({ action: "recording.cancelAll" }).catch(() => undefined)
       overrides = undefined
       autoUpdate = undefined
       browser = undefined
@@ -381,7 +529,11 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
       // A missing relay is normal until an agent's browse tools (or the browse CLI) start one.
       else setStatus(openedAt === undefined ? "offline" : "connecting")
       handshake.settle(mine)
-      if (!presenceOnly) schedule(quiet && openedAt === undefined)
+      // One rate-limited scan may find a relay that moved to a fallback port (cli/src/relay/port.ts).
+      const missed = presenceOnly ? () => undefined : () => schedule(quiet && openedAt === undefined, openedAt !== undefined)
+      if (discovery.afterClose({ trusted: handshake.trusted.has(current), deliberate: isDeliberateClose(event.code, event.reason), code: event.code }, missed))
+        return
+      if (!presenceOnly) schedule(quiet && openedAt === undefined, openedAt !== undefined)
     }
   }
 
@@ -411,6 +563,10 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
       void debuggerOps.recover(tabId, reason)
       return
     }
+    if (reason === "canceled_by_user") {
+      void releaseCanceledTab(tabId)
+      return
+    }
     forget(tabId)
     send({ method: "debugger.detached", params: { tabId, reason } })
   })
@@ -426,24 +582,32 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
   // Never close a tab while its agent runs a script on it, waits for the user there, or records it.
   TabCleanup.guard((tabId) => {
     const state = pageStatuses.get(tabId)?.state
-    return recordingTabs.has(tabId) || state === "waiting" || state === "running"
+    return state === "waiting" || state === "running"
   })
   AgentGroups.keepOpenWhile((tabId) => pageStatuses.get(tabId)?.state === "waiting")
-  chrome.tabs.onRemoved.addListener((tabId) => {
-    recordingTabs.delete(tabId)
-    void chrome.runtime.sendMessage({ action: "recording.cancel", tabId }).catch(() => undefined)
+  const tabRemoved = (tabId: number) => {
+    canceledAgentTabs.delete(tabId)
+    closedWhileRestoring?.add(tabId)
     if (relayTabs.has(tabId)) log.add("tab.removed", { tabId })
     forget(tabId)
-    pendingAttach.delete(tabId)
+    cancelPending(tabId)
     if (badges.delete(tabId)) input.badgesChanged()
     send({ method: "tabs.removed", params: { tabId } })
     grouping.recountShared()
-  })
+  }
+  chrome.tabs.onRemoved.addListener((tabId) => tabRemoved(tabId))
+  // A tab Chrome swaps for another (a discard, a prerender) gets a new id and no onRemoved for the old one, which
+  // the relay would otherwise keep as a target that answers "No tab with given id".
+  chrome.tabs.onReplaced.addListener((_addedTabId, removedTabId) => tabRemoved(removedTabId))
   chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === ALARM && !retry) void connect("alarm")
+    // A suspended worker restarts with no pending timer, so this only helps a live worker skip a backoff timer still
+    // waiting. connect() reuses a socket that's still connecting or open, so this can't stack connections.
+    if (alarm.name === ALARM) void connect("alarm")
   })
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && (AGENT_CURSOR_KEY in changes || HUMAN_INPUT_KEY in changes)) void sendSettings()
+    if (area === "local" && HUMAN_INPUT_KEY in changes) void sendSettings()
+    if (area === "local" && MUTE_TABS_KEY in changes)
+      void TabCleanup.setMuted(muteTabs(changes[MUTE_TABS_KEY]?.newValue) === "on").catch(() => undefined)
   })
   // A code entered on the status page, a new relay address or a new name takes effect on a fresh connection.
   chrome.storage.onChanged.addListener(handshake.onPairingStorageChanged)
@@ -469,19 +633,58 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
 
   return {
     state: snapshot,
-    badge: (tabId: number) => badges.get(tabId),
+    /** The toolbar badge for a tab: a click waiting for the relay says so until it goes, or is taken back. */
+    badge: (tabId: number) => {
+      const queued = pendingAttach.get(tabId)
+      return queued === undefined ? badges.get(tabId) : queuedBadge(queued)
+    },
     /** The user lets agents use this tab, or stops them (the toolbar button); toggles. */
-    attachTab(tabId: number) {
+    async attachTab(tabId: number) {
       log.add("attach.requested", { tabId, connected: !!open() })
-      if (open() && status === "connected") return send({ method: "toolbar.clicked", params: { tabId } })
-      // No relay yet: the click is queued until one starts; a second click takes it back.
-      if (pendingAttach.delete(tabId)) return
-      pendingAttach.add(tabId)
+      // Wait for the queue a previous worker left: a click on a tab it holds is the user's second one.
+      await restored
+      // A lend makes the tab the user's again; do that before the relay answers the click with `tabs.ungroup`, which
+      // must leave a lent tab open. A take-back (the tab is already an agent tab, or a queued lend) keeps tracking.
+      const lending = !relayTabs.has(tabId) && !pendingAttach.has(tabId)
+      // A click that reaches the relay always goes through: the relay may still hold the tab as an agent's after Chrome
+      // dropped its debugger (a navigation to chrome://, say), and the button must stay able to stop that agent. The
+      // attach reply then says why the tab couldn't be lent.
+      if (open() && status === "connected") {
+        // Queued and not sent yet: this click takes it back rather than queueing it a second time.
+        if (cancelPending(tabId)) return
+        if (lending) {
+          await lendTab(tabId)
+          ToolbarNotice.expect(tabId)
+        }
+        return send({ method: "toolbar.clicked", params: { tabId } })
+      }
+      // No relay yet: a second click takes the queued one back before anything else.
+      if (cancelPending(tabId)) return
+      if (lending) {
+        // The user clicked to keep an agent-opened tab, so take it off idle cleanup even if the page can't be queued.
+        await lendTab(tabId)
+        // A page that can't be attached can't be queued either; say why now instead of after a reconnect.
+        const blocked = await ToolbarNotice.unavailable(tabId)
+        if (blocked) {
+          log.add("attach.unavailable", { tabId, reason: blocked })
+          return
+        }
+      }
+      // This click woke a worker that was still starting, and the connection check may have found the browser unpaired
+      // or the relay too old while the page was judged. Such a relay never takes a queued click back; the next click
+      // opens the setup page.
+      if (unusable(status)) {
+        log.add("attach.dropped", { reason: status, tabs: 1 })
+        return
+      }
+      pendingAttach.set(tabId, lending)
+      savePending()
+      input.badgesChanged()
       attempts = 0
       void connect("attach")
     },
     /**
-     * Content-script and offscreen messages. Returns undefined when the message isn't for the relay link, true when
+     * Content-script messages. Returns undefined when the message isn't for the relay link, true when
      * the answer comes later through sendResponse (keep the channel open), and false when it was handled.
      */
     runtimeMessage(message: unknown, sender: chrome.runtime.MessageSender, sendResponse: (response: unknown) => void) {
@@ -503,35 +706,6 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
           log.add("handoff.completed", { tabId, from: "page" })
           send({ method: "handoff.completed", params: { tabId, handoffId: message.handoffId } })
         }
-        return false
-      }
-      const offscreenMessage = message as unknown as OffscreenOutgoingMessage
-      if (offscreenMessage.action === "recording.chunk") {
-        // The recording document waits for this answer before it sends the next chunk.
-        void recording
-          .sendRecordingChunk(
-            encodeRecordingFrame({
-              tabId: offscreenMessage.tabId,
-              sequence: offscreenMessage.sequence,
-              final: offscreenMessage.final,
-              payload: offscreenMessage.final
-                ? new Uint8Array()
-                : Uint8Array.from(atob(offscreenMessage.dataBase64), (char) => char.charCodeAt(0)),
-            }),
-          )
-          .then(
-            () => sendResponse({ success: true }),
-            (error: unknown) => {
-              log.add("recording.chunk.error", { tabId: offscreenMessage.tabId, error: text(error) })
-              sendResponse({ success: false, error: text(error) })
-            },
-          )
-        return true
-      }
-      if (offscreenMessage.action === "recording.cancelled") {
-        log.add("recording.cancelled", { tabId: offscreenMessage.tabId })
-        recordingTabs.delete(offscreenMessage.tabId)
-        send({ method: "recording.cancelled", params: { tabId: offscreenMessage.tabId } })
         return false
       }
       return undefined

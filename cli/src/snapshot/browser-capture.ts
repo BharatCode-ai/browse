@@ -1,15 +1,16 @@
-import type { SnapshotCaptureSettings, SnapshotEntry } from "./types.ts"
+import { snapshotNamingInBrowser, type SnapshotNaming } from "./naming.ts"
+import type { SnapshotCaptureResult, SnapshotCaptureSettings, SnapshotEntry } from "./types.ts"
 
 // Self-contained browser evaluation script: serialized via Function.prototype.toString() into page.evaluate().
-// Do not reference module-level runtime imports inside captureSnapshotInBrowser.
-export const captureSnapshotInBrowser = (
+// Do not reference module-level runtime imports inside captureSnapshotInBrowser; browserCapture passes `naming`.
+const captureSnapshotInBrowser = (
   rootOrSettings: Element | SnapshotCaptureSettings,
-  locatorSettings?: SnapshotCaptureSettings,
-) => {
+  locatorSettings: SnapshotCaptureSettings | undefined,
+  naming: SnapshotNaming,
+): SnapshotCaptureResult => {
   type BrowserEntry = SnapshotEntry
   const settings = locatorSettings ?? rootOrSettings as SnapshotCaptureSettings
 
-  const normalize = (value: string): string => value.replace(/\s+/g, " ").trim()
   const truncate = (value: string, maxLength: number): string => {
     if (value.length <= maxLength) return value
     const prefix = value.slice(0, maxLength + 1)
@@ -17,214 +18,18 @@ export const captureSnapshotInBrowser = (
     return `${prefix.slice(0, boundary >= Math.floor(maxLength * 0.6) ? boundary : maxLength).trimEnd()}...`
   }
   const quote = (value: string): string => value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
-  const styleCache = new WeakMap<Element, CSSStyleDeclaration>()
-  const styleOf = (element: Element): CSSStyleDeclaration => {
-    let cached = styleCache.get(element)
-    if (!cached) {
-      cached = window.getComputedStyle(element)
-      styleCache.set(element, cached)
-    }
-    return cached
-  }
-  const visibleCache = new WeakMap<Element, boolean>()
-  const visibleAssociatedLabel = (element: Element): HTMLLabelElement | undefined => {
-    if (!(element instanceof HTMLInputElement) || (element.type !== "radio" && element.type !== "checkbox")) {
-      return undefined
-    }
-    return Array.from(element.labels ?? []).find((label) => isVisible(label))
-  }
-  const isVisible = (element: Element): boolean => {
-    const cached = visibleCache.get(element)
-    if (cached !== undefined) return cached
-    const style = styleOf(element)
-    let result = true
-    if (style.display === "none" || style.visibility === "hidden") {
-      result = false
-    } else if (style.opacity === "0") {
-      result = Boolean(visibleAssociatedLabel(element))
-    } else if (style.display === "contents") {
-      const children = [
-        ...Array.from(element.children ?? []),
-        ...Array.from(element.shadowRoot?.children ?? []),
-      ]
-      result = children.some(isVisible)
-    } else {
-      const rect = element.getBoundingClientRect()
-      result = (rect.width >= 1 && rect.height >= 1) || Boolean(visibleAssociatedLabel(element))
-    }
-    visibleCache.set(element, result)
-    return result
-  }
-  const explicitAriaName = (element: Element): string => {
-    const ariaLabel = element.getAttribute("aria-label")
-    if (ariaLabel) return normalize(ariaLabel)
-    const labelledBy = element.getAttribute("aria-labelledby")
-    if (labelledBy) {
-      const rootNode = element.getRootNode() as Document | ShadowRoot
-      const labelled = normalize(labelledBy.split(/\s+/).map((id) => (rootNode.getElementById?.(id) ?? document.getElementById(id))?.textContent ?? "").join(" "))
-      if (labelled) return labelled
-    }
-    return ""
-  }
-  const titleName = (element: Element): string => normalize(element.getAttribute("title") ?? "")
-  const labelledName = (element: Element): string => explicitAriaName(element) || titleName(element)
-  const safeTextCache = new WeakMap<Element, string>()
-  const safeText = (element: Element): string => {
-    const cached = safeTextCache.get(element)
-    if (cached !== undefined) return cached
-    const rootStyle = styleOf(element)
-    if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true" || rootStyle.display === "none" || rootStyle.visibility === "hidden" || rootStyle.opacity === "0") {
-      safeTextCache.set(element, "")
-      return ""
-    }
-    if (element.firstElementChild === null && !element.shadowRoot && element.localName !== "slot") {
-      const result = normalize(element.textContent ?? "")
-      safeTextCache.set(element, result)
-      return result
-    }
-    const parts: string[] = []
-    const nearestBlock = (start: Element | null): Element => {
-      let current = start
-      while (current && current !== element && element.contains(current)) {
-        const display = styleOf(current).display
-        if (display && display !== "inline" && display !== "contents") return current
-        current = current.parentElement
-      }
-      return element
-    }
-    let lastBlock: Element | undefined
-    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
-      acceptNode(node) {
-        if (node instanceof Element) {
-          const local = node.localName
-          if (local === "input" || local === "textarea" || local === "select" || local === "script" || local === "style" || local === "noscript" || local === "template") {
-            return NodeFilter.FILTER_REJECT
-          }
-          const style = styleOf(node)
-          if (node.hasAttribute("hidden") || node.getAttribute("aria-hidden") === "true" || style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
-            return NodeFilter.FILTER_REJECT
-          }
-          if (node !== element && (node.hasAttribute("aria-label") || node.hasAttribute("aria-labelledby"))) {
-            const ariaText = explicitAriaName(node)
-            if (ariaText) {
-              parts.push(` ${ariaText} `)
-              lastBlock = undefined
-            }
-            return NodeFilter.FILTER_REJECT
-          }
-        }
-        return NodeFilter.FILTER_ACCEPT
-      },
-    })
-    let node = walker.nextNode()
-    while (node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const block = nearestBlock(node.parentElement)
-        if (lastBlock && lastBlock !== block) parts.push(" ")
-        parts.push(node.textContent ?? "")
-        lastBlock = block
-      } else if (node instanceof HTMLImageElement) {
-        const alt = node.getAttribute("alt")
-        if (alt) parts.push(` ${alt} `)
-        lastBlock = undefined
-      } else if (typeof HTMLSlotElement !== "undefined" && node instanceof HTMLSlotElement) {
-        for (const assigned of node.assignedNodes({ flatten: true })) {
-          if (assigned.nodeType === Node.TEXT_NODE) {
-            parts.push(assigned.textContent ?? "")
-          } else if (assigned instanceof Element) {
-            parts.push(safeText(assigned))
-          }
-        }
-        lastBlock = undefined
-      } else if (node instanceof Element && node.tagName === "BR") {
-        parts.push(" ")
-        lastBlock = undefined
-      }
-      node = walker.nextNode()
-    }
-    const result = normalize(parts.join(""))
-    safeTextCache.set(element, result)
-    return result
-  }
-  const authorAccessibleName = (element: Element): string => {
-    const labelled = explicitAriaName(element)
-    if (labelled) return labelled
-    if (
-      element instanceof HTMLInputElement ||
-      element instanceof HTMLTextAreaElement ||
-      element instanceof HTMLSelectElement ||
-      element instanceof HTMLButtonElement
-    ) {
-      const label = element.labels?.[0]
-      if (label) {
-        const labelText = safeText(label)
-        if (labelText) return labelText
-      }
-    }
-    if (element instanceof HTMLInputElement && (element.type === "button" || element.type === "submit" || element.type === "reset")) {
-      const buttonValue = normalize(element.value || (element.type === "submit" ? "Submit" : element.type === "reset" ? "Reset" : ""))
-      if (buttonValue) return buttonValue
-    }
-    const title = titleName(element)
-    if (title) return title
-    const placeholder = element.getAttribute("placeholder")
-    if (placeholder) return normalize(placeholder)
-    return ""
-  }
-  const accessibleNameCache = new WeakMap<Element, string>()
-  const accessibleName = (element: Element): string => {
-    const cached = accessibleNameCache.get(element)
-    if (cached !== undefined) return cached
-    let result = ""
-    const labelled = explicitAriaName(element)
-    if (labelled) {
-      result = labelled
-    } else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
-      result = authorAccessibleName(element)
-    } else {
-      const alt = element.getAttribute("alt")
-      const raw = alt || safeText(element) || titleName(element) ||
-        element.querySelector?.("[aria-label]")?.getAttribute("aria-label") ||
-        element.querySelector?.("svg title")?.textContent ||
-        ""
-      result = normalize(raw)
-    }
-    accessibleNameCache.set(element, result)
-    return result
-  }
-  const roleFor = (element: Element): string => {
-    const explicit = element.getAttribute("role")
-    if (explicit) return explicit
-    if (/^H[1-6]$/.test(element.tagName)) return "heading"
-    if (element instanceof HTMLAnchorElement || (element.tagName.toLowerCase() === "a" && element.hasAttribute("href"))) return "link"
-    if (element instanceof HTMLButtonElement) return "button"
-    if (element.tagName === "SUMMARY") return "summary"
-    if (element instanceof HTMLTextAreaElement) return "textbox"
-    if (element instanceof HTMLSelectElement) return element.hasAttribute("multiple") || element.size > 1 ? "listbox" : "combobox"
-    if (element instanceof HTMLInputElement) {
-      if (element.type === "checkbox") return "checkbox"
-      if (element.type === "radio") return "radio"
-      if (element.type === "number") return "spinbutton"
-      if (element.type === "range") return "slider"
-      if (["email", "search", "tel", "text", "url"].includes(element.type)) {
-        const listId = element.getAttribute("list")?.trim().split(/\s+/)[0]
-        const list = listId ? (element.getRootNode() as Document | ShadowRoot).getElementById(listId) : null
-        if (list?.tagName === "DATALIST") return "combobox"
-      }
-      if (element.type === "search") return "searchbox"
-      if (element.type === "button" || element.type === "submit" || element.type === "reset" || element.type === "file") return "button"
-      return "textbox"
-    }
-    if (element instanceof HTMLDialogElement) return "dialog"
-    if (element instanceof HTMLFieldSetElement || element.tagName === "DETAILS") return "group"
-    if (element instanceof HTMLTableElement) return "table"
-    if (element instanceof HTMLTableRowElement) return "row"
-    if (element instanceof HTMLUListElement || element instanceof HTMLOListElement) return "list"
-    if (element instanceof HTMLLIElement) return "listitem"
-    if (element.tagName === "PRE" || element.tagName === "CODE") return "code"
-    if (element.tagName === "NAV") return "navigation"
-    return element.tagName.toLowerCase()
-  }
+  const {
+    normalize,
+    styleOf,
+    isVisible,
+    visibleAssociatedLabel,
+    explicitAriaName,
+    labelledName,
+    safeText,
+    accessibleName,
+    roleFor,
+    identityNameFor,
+  } = naming
   const isRowCell = (child: Element): boolean => {
     const local = child.localName
     if (local === "th" || local === "td") return true
@@ -311,15 +116,24 @@ export const captureSnapshotInBrowser = (
     return ""
   }
   let autoScopedMain = false
+  let rootNote: string | undefined
   const root = rootOrSettings instanceof Element
     ? rootOrSettings
     : (() => {
         if (settings.rootSelector) {
-          const matches = document.querySelectorAll(settings.rootSelector)
-          if (matches.length !== 1) {
+          const matches = Array.from(document.querySelectorAll(settings.rootSelector))
+          if (matches.length === 1) return matches[0]!
+          // Only a `within` selector is forgiven; a ref root must still identify exactly one element.
+          if (!settings.reportRootFallback) {
             throw new Error(`snapshot within expects exactly one match for selector: ${settings.rootSelector}; got ${matches.length}`)
           }
-          return matches[0] as Element
+          const firstMatch = matches.find(isVisible) ?? matches[0]
+          if (firstMatch) {
+            rootNote = `within "${settings.rootSelector}" matched ${matches.length} elements; showing the first`
+            return firstMatch
+          }
+          rootNote = `within "${settings.rootSelector}" matched nothing; showing the whole page`
+          return (document.body ?? document.documentElement) as Element | null
         }
         const fallbackRoot = (document.body ?? document.documentElement) as Element | null
         if (!fallbackRoot) return null
@@ -333,7 +147,9 @@ export const captureSnapshotInBrowser = (
           return items.length > 0 && !items.some((item) => item.getAttribute("role") === "option" && item.querySelector?.("a[href], button"))
         }
         const portalMenus = Array.from(document.querySelectorAll("[role='listbox'], [role='menu']")).filter(isOpenListboxOrMenu)
-        const mains = Array.from(document.querySelectorAll("main")).filter(isVisible)
+        // A main the page switched off (inert or aria-hidden, e.g. behind a full-screen game or app) isn't what the
+        // user is looking at, so it doesn't scope the snapshot.
+        const mains = Array.from(document.querySelectorAll("main")).filter((main) => isVisible(main) && !main.closest?.("[inert], [aria-hidden='true']"))
         if (dialogs.length > 0 || (mains.length === 1 && portalMenus.some((menu) => !mains[0]!.contains?.(menu)))) {
           return fallbackRoot
         }
@@ -344,11 +160,18 @@ export const captureSnapshotInBrowser = (
         return fallbackRoot
       })()
   if (!root) {
-    return { entries: [], truncated: false }
+    return { entries: [], truncated: false, ...(rootNote ? { notes: [rootNote] } : {}) }
   }
   if ((settings.rootRole && roleFor(root) !== settings.rootRole) || (settings.rootName && accessibleName(root) !== settings.rootName)) {
     throw new Error("Snapshot ref no longer identifies the captured element; call snapshot() again")
   }
+  const nonTextInputTypes = new Set(["button", "checkbox", "file", "hidden", "image", "radio", "reset", "submit"])
+  const isNativeTextControl = (element: Element): element is HTMLInputElement | HTMLTextAreaElement =>
+    element instanceof HTMLTextAreaElement || (element instanceof HTMLInputElement && !nonTextInputTypes.has(element.type))
+  const hiddenReadonlyAutocompleteTokens = new Set([
+    "current-password", "new-password", "one-time-code",
+    "cc-number", "cc-csc", "cc-exp", "cc-exp-month", "cc-exp-year",
+  ])
   const detailsFor = (element: Element): string | undefined => {
     const details: string[] = []
     if (element instanceof HTMLInputElement) {
@@ -357,6 +180,15 @@ export const captureSnapshotInBrowser = (
     const ariaChecked = element.getAttribute("aria-checked")
     if ((ariaChecked === "true" || ariaChecked === "false" || ariaChecked === "mixed") && !(element instanceof HTMLInputElement)) {
       details.push(ariaChecked === "true" ? "checked" : ariaChecked === "false" ? "unchecked" : "checked=mixed")
+    }
+    if (isNativeTextControl(element)) {
+      const autocomplete = (element.getAttribute("autocomplete") ?? "").toLowerCase().split(/\s+/)
+      const isPassword = element instanceof HTMLInputElement && element.type === "password"
+      if (element.readOnly && !isPassword && !autocomplete.some((token) => hiddenReadonlyAutocompleteTokens.has(token))) {
+        details.push("readonly")
+        const value = normalize(element.value)
+        if (value) details.push(`value="${quote(truncate(value, 80))}"`)
+      }
     }
     if (element instanceof HTMLSelectElement) {
       const selected = element.selectedOptions[0]?.textContent
@@ -526,6 +358,40 @@ export const captureSnapshotInBrowser = (
     }
     return localCssPath(element, document)
   }
+  const frameTags = new Set(["iframe", "frame"])
+  // Host or protocol only: a path, query or data/blob body can carry a session token into the transcript.
+  const frameHost = (element: Element): string => {
+    const src = element.getAttribute("src")
+    if (!src) return ""
+    try {
+      const url = new URL(src, document.baseURI)
+      return url.host || url.protocol.replace(/:$/, "")
+    } catch {
+      return ""
+    }
+  }
+  const frameName = (element: Element): string => {
+    const labelled = labelledName(element)
+    if (labelled) return labelled
+    const name = normalize(element.getAttribute("name") ?? "")
+    if (name) return name
+    return frameHost(element) || "Frame"
+  }
+  const frameSource = (element: Element): string | undefined => {
+    const host = frameHost(element)
+    return host ? `src=${truncate(host, 80)}` : undefined
+  }
+  // A readable frame selector survives small DOM changes better than `iframe:nth-of-type(3)`.
+  const frameSelector = (element: Element): string => {
+    const tag = element.localName
+    for (const attribute of ["title", "name", "src"]) {
+      const value = element.getAttribute(attribute)
+      if (!value) continue
+      const candidate = `${tag}[${attribute}="${quote(value)}"]`
+      if (isUniqueSelector(document, candidate)) return candidate
+    }
+    return cssPath(element)
+  }
   const rootHeadings = Array.from(root.querySelectorAll("h1, h2, h3, h4, h5, h6, [role='heading']")).map((heading) => {
     const candidate = /^H([1-6])$/.exec(heading.tagName)?.[1]
     return {
@@ -575,6 +441,7 @@ export const captureSnapshotInBrowser = (
     "combobox", "searchbox", "textbox",
     "slider", "spinbutton", "treeitem",
   ])
+  const controlSelector = ["a[href]", "[contenteditable]", ...interactiveTags, ...Array.from(interactiveRoles, (role) => `[role='${role}']`)].join(", ")
   const extraCandidateTags = new Set(["h1", "h2", "h3", "h4", "h5", "h6", "nav", "p"])
   const extraCandidateRoles = new Set(["heading", "navigation", "alert", "status"])
   const isStructuralElement = (element: Element): boolean => {
@@ -592,12 +459,14 @@ export const captureSnapshotInBrowser = (
   }
   const isCandidateElement = (element: Element): boolean => {
     const local = element.localName
+    if (frameTags.has(local)) return true
     if (extraCandidateTags.has(local) || structuralTags.has(local) || interactiveTags.has(local)) return true
     if (local === "a" && element.hasAttribute("href")) return true
     if (element.hasAttribute("contenteditable")) return true
     const role = element.getAttribute("role")
     return role !== null && (extraCandidateRoles.has(role) || structuralRoles.has(role) || interactiveRoles.has(role))
   }
+  const isLinkElement = (element: Element): boolean => roleFor(element) === "link"
   const structuralKeys = new WeakMap<Element, string>()
   let nextStructuralKey = 1
   const structuralKey = (element: Element): string => {
@@ -759,7 +628,7 @@ export const captureSnapshotInBrowser = (
     return 2
   }
 
-  type PendingEntry = BrowserEntry & { readonly interactiveElement?: Element }
+  type PendingEntry = BrowserEntry & { readonly interactiveElement?: Element; readonly frameElement?: Element }
   const entries: PendingEntry[] = []
   let truncated = false
   const add = (entry: PendingEntry): void => {
@@ -782,6 +651,82 @@ export const captureSnapshotInBrowser = (
   const collapsedNavigation = new Set<Element>()
   const nonCollapsibleNavigation = new WeakSet<Element>()
   let reservedLists = 0
+  const scopeNote = (() => {
+    // A frame document's notes are discarded, and `within: "body"` would not mean that frame anyway.
+    if (!autoScopedMain || window.top !== window) return undefined
+    const scope = (document.body ?? document.documentElement) as Element | null
+    if (!scope) return undefined
+    const landmarkSelector = "nav, [role='navigation'], aside, [role='complementary'], [role='search'], [role='region'], form, [role='form'], footer, [role='contentinfo'], search, header, [role='banner']"
+    const maxScopeControls = 200
+    const headerLandmarks = new Set<Element>()
+    for (const candidate of headerCandidateSet) {
+      for (let node = parentElementOrHost(candidate); node; node = parentElementOrHost(node)) {
+        if (node === root || node.contains?.(root)) break
+        if (node.matches(landmarkSelector)) headerLandmarks.add(node)
+      }
+    }
+    const landmarks = new Set<Element>()
+    let controls = 0
+    let frames = 0
+    let capped = false
+    const skipsToMain = (element: Element): boolean => {
+      if (element.localName !== "a") return false
+      const href = element.getAttribute("href") ?? ""
+      if (!href.startsWith("#") || href.length === 1) return false
+      let id = href.slice(1)
+      try {
+        id = decodeURIComponent(id)
+      } catch {
+        return false
+      }
+      const target = document.getElementById(id)
+      return target !== null && (target === root || root.contains?.(target) || target.contains?.(root))
+    }
+    const countControl = (element: Element): boolean => {
+      if (headerCandidateSet.has(element) || skipsToMain(element) || element.contains?.(root) || !isVisible(element)) return true
+      if (controls >= maxScopeControls) {
+        capped = true
+        return false
+      }
+      controls++
+      for (let node = parentElementOrHost(element); node; node = parentElementOrHost(node)) {
+        if (node === root) break
+        // A landmark that wraps main is the page, not something outside it.
+        if (node.contains?.(root)) break
+        if (!node.matches(landmarkSelector)) continue
+        if (headerLandmarks.has(node)) break
+        // A form is a landmark only when it has a name; unnamed forms are just boxes.
+        if ((node.localName === "form" || node.getAttribute("role") === "form") && !labelledName(node)) continue
+        if (!isVisible(node)) continue
+        landmarks.add(node)
+        break
+      }
+      return true
+    }
+    const walk = (node: Element | ShadowRoot | Document): boolean => {
+      for (let child = node.firstElementChild; child; child = child.nextElementSibling) {
+        if (child === root) continue
+        if (child.localName === "iframe" && isVisible(child)) frames++
+        if (child.matches(controlSelector) && !countControl(child)) return false
+        if (child.shadowRoot && !walk(child.shadowRoot)) return false
+        if (child.firstElementChild && !walk(child)) return false
+      }
+      return true
+    }
+    if (scope.shadowRoot) walk(scope.shadowRoot)
+    if (!capped) walk(scope)
+    if (controls === 0 && frames === 0) return undefined
+    const count = capped ? `${controls}+` : String(controls)
+    const landmarkCount = capped ? `${landmarks.size}+` : String(landmarks.size)
+    const parts = [
+      ...(landmarks.size > 0 ? [`${landmarkCount} ${landmarks.size === 1 ? "landmark" : "landmarks"}`] : []),
+      // An iframe outside main can be the whole app (a game or editor over the page), so it's always named.
+      ...(frames > 0 ? [`${frames} ${frames === 1 ? "iframe" : "iframes"}`] : []),
+      ...(controls > 0 ? [`${count} ${controls === 1 && !capped ? "control" : "controls"}`] : []),
+    ]
+    const omitted = landmarks.size + frames + controls
+    return `scoped to <main>; ${parts.join(" and ")} outside it ${omitted === 1 && !capped ? "is" : "are"} not shown (within: "body" to include them)`
+  })()
 
   function* iterateCandidates(scope: Element): Generator<Element> {
     for (const headerEl of headerCandidateSet) yield headerEl
@@ -803,28 +748,56 @@ export const captureSnapshotInBrowser = (
       truncated = true
       break
     }
-    if (settings.compact && !headerCandidateSet.has(element)) {
+    if (settings.compact && settings.expandNavigation !== true && !settings.interactive && !headerCandidateSet.has(element)) {
       const navigation = closestDeep(element, "nav, [role='navigation'], aside, [role='complementary'], [data-slot='sidebar'], [data-sidebar='sidebar']")
       if (navigation && collapsedNavigation.has(navigation)) {
         continue
       }
       if (navigation && navigation !== root && !navigation.contains?.(root) && !nonCollapsibleNavigation.has(navigation)) {
-        const isCollapsibleNav = isVisible(navigation) && (
-          navigation.matches("nav, [role='navigation']") ||
-          (querySelectorAllDeep(navigation, "a[href]").length >= 8 && !navigation.querySelector?.("h1, main, [role='main'], input, textarea, select"))
-        )
-        if (isCollapsibleNav) {
-          collapsedNavigation.add(navigation)
-          const count = querySelectorAllDeep(navigation, "a[href], button").length
-          add({ depth: headingDepth(navigation), role: "navigation", name: truncate(labelledName(navigation), 100) || "Navigation", details: `${count} controls`, priority: 0 })
-          continue
+        if (!isVisible(navigation)) {
+          // isVisible doesn't inherit, so an invisible landmark can still have visible positioned children:
+          // skip the summary but let the current element go through normal processing.
+          nonCollapsibleNavigation.add(navigation)
+        } else {
+          // Only visible controls decide: a display:none mobile menu button does not keep the whole nav open.
+          const controls = querySelectorAllDeep(navigation, controlSelector).filter(isVisible)
+          // Only a pure link list is a landmark worth summarising. A nav of buttons (a conversation list, a
+          // toolbar) is content: collapsing it would hide every control, and the summary carries no ref.
+          const isLinkList = controls.length > 0 && controls.every(isLinkElement)
+          const isCollapsibleNav = isLinkList && (
+            navigation.matches("nav, [role='navigation']") ||
+            (controls.length >= 8 && !navigation.querySelector?.("h1, main, [role='main'], input, textarea, select"))
+          )
+          if (isCollapsibleNav) {
+            collapsedNavigation.add(navigation)
+            // Keep the heading-based depth its expanded children would have, plus any structural parents.
+            const parentKeys = structuralParentKeys(navigation)
+            const baseDepth = headingDepth(navigation)
+            const count = controls.length
+            add({
+              depth: baseDepth + parentKeys.length,
+              baseDepth,
+              ...(parentKeys.length > 0 ? { parentKeys } : {}),
+              role: "navigation",
+              name: truncate(labelledName(navigation), 100) || "Navigation",
+              details: `${count} ${count === 1 ? "link" : "links"}, collapsed`,
+              priority: 0,
+            })
+            continue
+          }
+          nonCollapsibleNavigation.add(navigation)
         }
-        nonCollapsibleNavigation.add(navigation)
       }
     }
     if (!isVisible(element)) continue
     const role = roleFor(element)
     const isHeading = role === "heading"
+    const isFrame = frameTags.has(element.localName)
+    // A 1-2px tracking iframe is not worth a line or a document capture; real embeds are larger.
+    if (isFrame) {
+      const rect = element.getBoundingClientRect()
+      if (rect.width < 20 && rect.height < 20) continue
+    }
     if (isHeading && isRedundantHeadingForLink(element)) continue
     if (
       role === "combobox" &&
@@ -839,7 +812,7 @@ export const captureSnapshotInBrowser = (
     const isInteractive = isInteractiveElement(element)
     const isSafetyText = role === "alert" || role === "status"
     const isParagraph = element.localName === "p"
-    const isStructural = !isInteractive && isStructuralElement(element)
+    const isStructural = isFrame || (!isInteractive && isStructuralElement(element))
     if (isStructural) {
       if (role === "listbox" && (element.getAttribute("aria-label") === "slider" || element.getAttribute("aria-roledescription") === "carousel")) {
         continue
@@ -870,14 +843,11 @@ export const captureSnapshotInBrowser = (
     ) {
       continue
     }
-    const displayName = isStructural ? structuralName(element, role) : accessibleName(element)
+    const displayName = isFrame ? frameName(element) : isStructural ? structuralName(element, role) : accessibleName(element)
     if (isInteractive && isDuplicateCardLink(element, displayName)) continue
-    const nameFromAuthorOnly = role === "combobox" || role === "listbox" || role === "textbox" || role === "searchbox" || role === "spinbutton" || role === "slider"
-    const identityName = isInteractive
-      ? (nameFromAuthorOnly ? authorAccessibleName(element) : displayName)
-      : displayName
+    const identityName = isInteractive ? identityNameFor(element, role) : displayName
     const isDisabled = ((element as HTMLButtonElement).disabled === true) || element.getAttribute("aria-disabled") === "true"
-    if (isInteractive && isDisabled && !displayName && !element.getAttribute("name")) continue
+    if (isInteractive && isDisabled && !displayName && !element.getAttribute("name") && !isNativeTextControl(element)) continue
     const fallbackName = role === "group" ? "Group"
       : role === "dialog" || role === "alertdialog" ? "Dialog"
       : role === "listbox" ? "Listbox"
@@ -889,7 +859,7 @@ export const captureSnapshotInBrowser = (
       : ""
     const name = truncate(displayName || fallbackName, isParagraph || isSafetyText || isStructural ? 180 : 120)
     if (!name) continue
-    const details = isHeading ? `level=${headingDepth(element) + 1}` : detailsFor(element)
+    const details = isHeading ? `level=${headingDepth(element) + 1}` : isFrame ? frameSource(element) : detailsFor(element)
     const primaryLink = (role === "link" && isPrimaryLink(element)) || headerCandidateSet.has(element)
     const baseDepth = headingDepth(element)
     const parentKeys = structuralParentKeys(element)
@@ -917,9 +887,10 @@ export const captureSnapshotInBrowser = (
       ...(parentKeys.length > 0 ? { parentKeys } : {}),
       role,
       name,
+      ...(element === root ? { root: true } : {}),
       ...(isInteractive && identityName && !labelProxy ? { identityName } : {}),
       ...(labelProxy ? { selectorRole: "label" } : {}),
-      ...(isInteractive ? { interactiveElement: labelProxy ?? element } : {}),
+      ...(isInteractive ? { interactiveElement: labelProxy ?? element } : isFrame ? { frameElement: element } : {}),
       ...(details ? { details } : {}),
       priority: priorityFor({
         role: headerCandidateSet.has(element) ? "heading" : role,
@@ -927,6 +898,7 @@ export const captureSnapshotInBrowser = (
         primaryLink,
         inActiveOverlay,
         structuralEssential: isStructural &&
+          role !== "iframe" &&
           role !== "row" &&
           role !== "listitem" &&
           role !== "code" &&
@@ -940,9 +912,13 @@ export const captureSnapshotInBrowser = (
     .sort((left, right) => left.entry.priority - right.entry.priority || left.index - right.index)
     .slice(0, settings.maxItems)
     .sort((left, right) => left.index - right.index)
-    .map(({ entry: { interactiveElement, ...rest } }) => ({
+    .map(({ entry: { interactiveElement, frameElement, ...rest } }) => ({
       ...rest,
-      ...(interactiveElement ? { selector: cssPath(interactiveElement) } : {}),
+      ...(interactiveElement
+        ? { selector: cssPath(interactiveElement) }
+        : frameElement
+        ? { selector: frameSelector(frameElement), iframe: true }
+        : {}),
     }))
   const needsSettle = Boolean(
     !settings.rootSelector &&
@@ -953,10 +929,12 @@ export const captureSnapshotInBrowser = (
       (!selected.some((entry) => Boolean(entry.selector)) && typeof performance !== "undefined" && performance.now() < 2_500)
     ),
   )
+  const notes = [...(rootNote ? [rootNote] : []), ...(scopeNote ? [scopeNote] : [])]
   return {
     entries: selected,
     truncated: truncated || selected.length < entries.length,
     ...(needsSettle ? { needsSettle: true } : {}),
+    ...(notes.length > 0 ? { notes } : {}),
   }
 }
 
@@ -964,5 +942,6 @@ export const browserCapture = new Function(
   "rootOrSettings",
   "locatorSettings",
   `const __name = (target) => target
-return (${captureSnapshotInBrowser.toString()})(rootOrSettings, locatorSettings)`,
-) as typeof captureSnapshotInBrowser
+const naming = (${snapshotNamingInBrowser.toString()})()
+return (${captureSnapshotInBrowser.toString()})(rootOrSettings, locatorSettings, naming)`,
+) as (rootOrSettings: Element | SnapshotCaptureSettings, locatorSettings?: SnapshotCaptureSettings) => SnapshotCaptureResult

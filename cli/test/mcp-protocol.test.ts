@@ -1,11 +1,11 @@
 import * as RelayHarness from "./relay-harness.ts"
-import { bundleCli } from "../bundle.ts"
 import { afterAll, describe, expect, test } from "bun:test"
-import { spawn } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { bundleCli } from "../bundle.ts"
 import { startRelay, stopRelay } from "./relay-harness.ts"
+import { mcpStdio } from "./support/mcp-stdio.ts"
 import { freePort } from "./support/ports.ts"
 
 // The real MCP server over stdio, answering a pre-2026 client (initialize) and a 2026-07-28 client (request metadata).
@@ -18,28 +18,8 @@ const modernMeta = {
   "io.modelcontextprotocol/clientInfo": { name: "test", version: "0" },
 }
 
-function server(command = [process.execPath, path.join(import.meta.dir, "..", "src", "main.ts")], port?: number) {
-  const child = spawn(command[0]!, [...command.slice(1), "mcp"], {
-    stdio: ["pipe", "pipe", "ignore"],
-    env: { ...process.env, HOME: home, OPENCODE_BROWSER_HOME: home, ...(port ? { OPENCODE_BROWSER_PORT: String(port) } : {}), OPENCODE_BROWSER_AUTOSTART: "false", OPENCODE_BROWSER_UPDATE_CHECK: "0" },
-  })
-  const pending = new Map<number, (message: { result?: Record<string, unknown>; error?: unknown }) => void>()
-  let buffer = ""
-  let id = 0
-  child.stdout.on("data", (chunk) => {
-    buffer += chunk
-    for (let index = buffer.indexOf("\n"); index >= 0; index = buffer.indexOf("\n")) {
-      const message = JSON.parse(buffer.slice(0, index))
-      buffer = buffer.slice(index + 1)
-      pending.get(message.id)?.(message)
-    }
-  })
-  const request = (method: string, params: Record<string, unknown> = {}) =>
-    new Promise<{ result?: Record<string, unknown>; error?: unknown }>((resolve) => {
-      pending.set(++id, resolve)
-      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n")
-    })
-  return { request, notify: (method: string) => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method }) + "\n"), close: () => child.kill() }
+function server(command?: readonly string[], port?: number) {
+  return mcpStdio({ home, ...(port ? { port } : {}), ...(command ? { command } : {}) })
 }
 
 describe("MCP protocol versions", () => {
@@ -91,7 +71,7 @@ describe("MCP protocol versions", () => {
           const init = await mcp.request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "0" } })
           expect(init.result?.capabilities).toHaveProperty("tools")
           mcp.notify("notifications/initialized")
-          expect((await mcp.request("tools/list")).result?.tools).toHaveLength(18)
+          expect((await mcp.request("tools/list")).result?.tools).toHaveLength(13)
         } finally { mcp.close() }
       }
     } finally {
@@ -136,9 +116,10 @@ describe("MCP protocol versions", () => {
     const init = await mcp.request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "0" } })
     expect(init.result?.protocolVersion).toBe("2025-11-25")
     expect(init.result?.instructions).toContain("snapshot()")
+    expect(init.result?.instructions).toContain("exist only inside the `code` string")
     mcp.notify("notifications/initialized")
     expect(((await mcp.request("tools/list")).result?.tools as unknown[]).length).toBeGreaterThan(0)
-    expect((await mcp.request("tools/call", { name: "secrets_list", arguments: {} })).result?.isError).toBe(false)
+    expect((await mcp.request("tools/call", { name: "status", arguments: {} })).result).toBeDefined()
     mcp.close()
   }, 30_000)
 
@@ -182,7 +163,6 @@ describe("MCP protocol versions", () => {
       expect(annotations("session_delete")).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false })
       expect(annotations("tabs_cleanup")).toMatchObject({ destructiveHint: true, openWorldHint: false })
       expect(annotations("network")).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: false })
-      expect(annotations("secrets_refresh")).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true })
       // A browser joining or leaving changes no description or schema, so the client's prompt cache survives.
       second.close()
       await Bun.sleep(6_000)

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# publish-npm.sh <build dir> <binaries dir> [<signed dir>]: publishes the platform packages @opencode/browse-<target>
-# (opencode-browse-<target>-<version>.tgz: package/bin/browse, which the install script downloads), then
-# opencode-browse-<version>.tgz (@opencode/browse, the npx package), all with BROWSE_NPM_TAG. Names, the version and the
-# package set come from this script and the environment, never from the tarballs: each package.json is read as data and
-# must match. With a signed dir (sign-macos.sh), the macOS packages must come from it. Lifecycle scripts never run
-# (--ignore-scripts). npm authenticates with trusted publishing (OIDC); there is no token.
+# publish-npm.sh <build dir> <binaries dir> [<macOS signed dir>] [<Windows signed dir>]: publishes the platform packages
+# @opencode/browse-<target> (opencode-browse-<target>-<version>.tgz: package/bin/browse, which the install script
+# downloads), then opencode-browse-<version>.tgz (@opencode/browse, the npx package), all with BROWSE_NPM_TAG. Names, the
+# version and the package set come from this script and the environment, never from the tarballs: each package.json is
+# read as data and must match. With a signed dir (sign-macos.sh, repack-windows.sh), the macOS and Windows packages must
+# come from it. Lifecycle scripts never run (--ignore-scripts). npm authenticates with trusted publishing (OIDC); there
+# is no token.
 . "$(dirname "$0")/lib.sh"
 
-build_dir=$1 binaries_dir=$2 signed_dir=${3:-}
-# The install script's targets (install); keep in step with cli/script/compile.ts.
+build_dir=$1 binaries_dir=$2 signed_dir=${3:-} signed_windows_dir=${4:-}
+# The install script's targets (install); keep in step with scripts/npm-package.ts.
 targets="linux-x64 linux-x64-baseline linux-arm64 linux-x64-musl linux-x64-baseline-musl linux-arm64-musl darwin-arm64 darwin-x64 darwin-x64-baseline windows-x64 windows-x64-baseline"
 
 check_package() { # <file> <name> [<os> <cpu> <libc or "">]
@@ -38,6 +39,7 @@ for target in $targets; do
   if [[ "$target" == *-musl ]]; then libc=musl; fi
   dir=$binaries_dir
   if [ -n "$signed_dir" ] && [ "$os" = darwin ]; then dir=$signed_dir; fi
+  if [ -n "$signed_windows_dir" ] && [ "$os" = win32 ]; then dir=$signed_windows_dir; fi
   file="$dir/opencode-browse-$target-$BROWSE_VERSION.tgz"
   check_package "$file" "@opencode/browse-$target" "$os" "$arch" "$libc"
   # Exactly the binary (executable), package.json and LICENSE, as the install script expects.
@@ -59,7 +61,9 @@ cd "$(mktemp -d)" || exit
 flags=(--tag "$BROWSE_NPM_TAG" --access public --ignore-scripts)
 if dry_run; then flags+=(--dry-run); else flags+=(--provenance); fi
 while IFS=$'\t' read -r name file; do
-  if ! dry_run && [ "$(npm view "$name@$BROWSE_VERSION" version 2> /dev/null)" = "$BROWSE_VERSION" ]; then
+  if [ "$(npm view "$name@$BROWSE_VERSION" version 2> /dev/null)" = "$BROWSE_VERSION" ]; then
+    # A dry run of an already published version (a check run of the current release) still checks the tarball.
+    if dry_run; then npm pack "$file" --dry-run > /dev/null; fi
     summary "$name@$BROWSE_VERSION is already on npm; nothing to publish."
     continue
   fi

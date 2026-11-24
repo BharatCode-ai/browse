@@ -1,26 +1,23 @@
-import { cliCommand } from "../paths.ts"
+import { cliCommand, stateRoot } from "../paths.ts"
 import { defaultPort } from "./helpers.ts"
+import {
+  configuredRelayPort,
+  endpointForPort,
+  processAlive,
+  readRelayState,
+  resolveRelayPort,
+} from "./port.ts"
 import { relayAuthorization } from "./secrets.ts"
 import { NodeHttpClient } from "@effect/platform-node"
 import { Config, Context, Effect, Layer, Option, Schema } from "effect"
 import { HttpClient, HttpClientRequest, type HttpClientResponse } from "effect/http"
 import {
-  type AuthProfileRequest,
   type AuthenticatedJsonRequest,
   AuthenticatedJsonOutcome,
-  AuthProfileSummary,
-  type AuthRefreshRequest,
-  type AuthRunRequest,
-  AuthRunResponse,
   ErrorEnvelope,
   type ExecuteRequest,
   ExecuteResponse,
   ExtensionStatus,
-  FlightRecorderCancelResponse,
-  type FlightRecorderSaveRequest,
-  FlightRecorderSaveResponse,
-  type FlightRecorderStartRequest,
-  FlightRecorderStatusResponse,
   NetworkCancelResponse,
   type NetworkSessionRequest,
   type NetworkStartRequest,
@@ -68,7 +65,11 @@ export const portConfig = Config.Int("OPENCODE_BROWSER_PORT").pipe(Config.withDe
  */
 export const extensionOriginsConfig = Config.String("OPENCODE_BROWSER_EXTENSION_ORIGINS").pipe(Config.withDefault(""))
 
-export const endpointForPort = (port: number): string => `http://127.0.0.1:${port}`
+export { endpointForPort } from "./port.ts"
+
+/** How long a read waits before this client has had any answer from the port, and after. See `make`. */
+export const unknownRelayReadSeconds = 5
+export const busyRelayReadSeconds = 30
 
 export class RelayUnreachable extends Schema.TaggedError<RelayUnreachable>()(
   "RelayClient.RelayUnreachable",
@@ -129,7 +130,7 @@ export interface Interface {
   readonly extensionStatus: Effect.Effect<ExtensionStatus, RelayClientError>
   readonly targets: Effect.Effect<readonly TargetSummary[], RelayClientError>
   readonly sessions: Effect.Effect<readonly SessionSummary[], RelayClientError>
-  readonly sessionNew: (id?: string | undefined, options?: { readonly readOnly?: boolean; readonly allowedOrigins?: readonly string[]; readonly browser?: string }) => Effect.Effect<SessionSummary, RelayClientError>
+  readonly sessionNew: (id?: string | undefined, options?: { readonly readOnly?: boolean; readonly allowedOrigins?: readonly string[]; readonly keepVisible?: boolean; readonly browser?: string }) => Effect.Effect<SessionSummary, RelayClientError>
   /** Replace a session's allowed origins; an empty list removes the allowlist. */
   readonly sessionAllowlist: (id: string, allowedOrigins: readonly string[]) => Effect.Effect<SessionSummary, RelayClientError>
   readonly sessionEnsure: (id: string, options?: { readonly readOnly?: boolean }) => Effect.Effect<SessionSummary, RelayClientError>
@@ -142,22 +143,16 @@ export interface Interface {
   readonly networkStatus: (request: NetworkSessionRequest) => Effect.Effect<NetworkStatusResponse, RelayClientError>
   readonly networkStop: (request: NetworkStopRequest) => Effect.Effect<NetworkStopResponse, RelayClientError>
   readonly networkCancel: (request: NetworkSessionRequest) => Effect.Effect<NetworkCancelResponse, RelayClientError>
-  readonly authStatus: (request: AuthProfileRequest) => Effect.Effect<AuthProfileSummary, RelayClientError>
-  readonly authRefresh: (request: AuthRefreshRequest) => Effect.Effect<NetworkStopResponse, RelayClientError>
-  readonly authRun: (request: AuthRunRequest) => Effect.Effect<AuthRunResponse, RelayClientError>
   readonly recordingStart: (request: RecordingStartRequest) => Effect.Effect<RecordingStartResponse, RelayClientError>
   readonly recordingStop: (target: RecordingTargetRequest) => Effect.Effect<RecordingStopResponse, RelayClientError>
   readonly recordingStatus: (target: RecordingTargetRequest) => Effect.Effect<RecordingStatusResponse, RelayClientError>
   readonly recordingCancel: (target: RecordingTargetRequest) => Effect.Effect<RecordingCancelResponse, RelayClientError>
-  readonly tabsCleanup: (idleMinutes?: number) => Effect.Effect<TabsCleanupResponse, RelayClientError>
+  /** With `sessions`, `idleMinutes` applies only to those sessions' tabs; other tabs also wait for the user's setting. */
+  readonly tabsCleanup: (idleMinutes?: number, sessions?: readonly string[]) => Effect.Effect<TabsCleanupResponse, RelayClientError>
   /** The user's settings (the extension's options page), with env overrides. */
   readonly settingsGet: Effect.Effect<SettingsGetResponse, RelayClientError>
   /** Changes settings; validated strictly by the relay. */
   readonly settingsSet: (changes: Record<string, unknown>) => Effect.Effect<SettingsSetResponse, RelayClientError>
-  readonly flightRecorderStart: (request: FlightRecorderStartRequest) => Effect.Effect<FlightRecorderStatusResponse, RelayClientError>
-  readonly flightRecorderStatus: (target: RecordingTargetRequest) => Effect.Effect<FlightRecorderStatusResponse, RelayClientError>
-  readonly flightRecorderSaveLast: (request: FlightRecorderSaveRequest) => Effect.Effect<FlightRecorderSaveResponse, RelayClientError>
-  readonly flightRecorderCancel: (target: RecordingTargetRequest) => Effect.Effect<FlightRecorderCancelResponse, RelayClientError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("opencode-browser-cli/RelayClient") {}
@@ -170,13 +165,16 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
   /** Sent as OpenCode-Browser-Client-Pid so the relay can end a capture or an implicit session once this process is gone. */
   readonly clientPid?: number
 }) {
-  const port = yield* portConfig.pipe(
+  // Validate OPENCODE_BROWSER_PORT as before; the endpoint itself is resolved on every request so a relay that moved
+  // to a fallback port is found without recreating this client (relay/port.ts).
+  yield* portConfig.pipe(
     Effect.mapError((cause) => new RelayConfigInvalid({
       message: `Invalid OPENCODE_BROWSER_PORT configuration: ${cause.message}`,
       cause,
     })),
   )
-  const endpoint = options?.endpoint ?? endpointForPort(port)
+  const currentEndpoint = (): string => options?.endpoint ?? endpointForPort(resolveRelayPort())
+  const relayPort = configuredRelayPort()
   const httpClient = yield* HttpClient.HttpClient
 
   const readBody = (
@@ -224,13 +222,22 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
       }),
     )
 
-  const transportError = (path: string) => (cause: unknown) =>
-    new RelayUnreachable({
+  const transportError = (path: string, at?: string) => (cause: unknown) => {
+    const endpoint = at ?? currentEndpoint()
+    return new RelayUnreachable({
       message: `browse relay is not reachable at ${endpoint}. Relay-backed CLI commands start it automatically; use \`${cliCommand("serve")}\` only for foreground debugging.`,
       endpoint,
       path,
       cause,
     })
+  }
+
+  const isRelayClientError = (error: unknown): error is RelayClientError =>
+    error instanceof RelayUnreachable ||
+    error instanceof RelayRejected ||
+    error instanceof RelayDecodeFailed ||
+    error instanceof RelayEncodeFailed ||
+    error instanceof RelayTimedOut
 
   // The relay rejects requests without this install's token (relay-secrets.ts). Read once it exists; a relay
   // started by this client creates it, so a failed read is retried on the next request.
@@ -245,14 +252,156 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
     return options?.clientPid === undefined ? authorized : HttpClientRequest.setHeader(authorized, "opencode-browser-client-pid", String(options.clientPid))
   }
 
-  const getJson = <A>(path: string, schema: Schema.ConstraintDecoder<A>): Effect.Effect<A, RelayClientError> =>
-    Effect.suspend(() => httpClient.execute(authorize(HttpClientRequest.get(new URL(path, endpoint))))).pipe(
-      Effect.mapError(transportError(path)),
-      Effect.flatMap((response) => handleResponse(response, path, schema)),
-      Effect.timeoutOrElse({ duration: 5000, orElse: () => Effect.fail(new RelayTimedOut({
-        message: `The relay on port ${new URL(endpoint).port} isn't answering (${path} timed out).`, path,
-      })) }),
+  // Every session's execute code shares the relay's event loop, so under load even /version can wait several seconds
+  // for its turn. Until this client has had any answer on the port, a stalled read means a frozen relay or another
+  // program, and fails fast. Once the relay has answered, a stalled read is most likely a busy relay, so it waits longer.
+  let relayAnswered = false
+  // The open version probe never carries the relay token (or this client's pid): another program holding the port
+  // must not receive either. See `version` and the fallback probe in relay/port.ts.
+  const executeUnauthorized = (path: string, request: HttpClientRequest.HttpClientRequest, at?: string) =>
+    httpClient.execute(request).pipe(
+      Effect.mapError(transportError(path, at)),
+      Effect.tap(() => Effect.sync(() => { relayAnswered = true })),
     )
+
+  type VerifiedEndpoint = {
+    readonly endpoint: string
+    readonly instanceId: string
+    /** relay.json's instance when this proof was made, so a file that later disappears forces another probe. */
+    readonly recorded: string | undefined
+  }
+  let verified: VerifiedEndpoint | undefined
+
+  const notBrowse = (endpoint: string, cause: unknown) =>
+    new RelayDecodeFailed({
+      message: `Relay port ${new URL(endpoint).port} is in use by another program (not a browse /version response).`,
+      path: "/version",
+      cause,
+    })
+
+  /**
+   * relay.json for the configured port when its process is alive. One read per verification: a live file naming
+   * another port, or another instance, means the endpoint under test is not this install's relay.
+   */
+  const liveRelayState = () => {
+    try {
+      const state = readRelayState(stateRoot(), relayPort)
+      return state && state.configuredPort === relayPort && processAlive(state.pid) ? state : undefined
+    } catch {
+      return undefined
+    }
+  }
+  const sameLiveState = (left: ReturnType<typeof liveRelayState>, right: ReturnType<typeof liveRelayState>) =>
+    left === undefined ? right === undefined : right !== undefined && left.port === right.port && left.instanceId === right.instanceId
+
+  // Bearer tokens only go to a port whose open /version proved it is this install's browse relay. Verified once per
+  // resolved endpoint (and instance), never for an endpoint that changed underneath this client.
+  const verifyEndpoint = (
+    endpoint: string,
+    state: ReturnType<typeof liveRelayState> = liveRelayState(),
+  ): Effect.Effect<VerifiedEndpoint, RelayClientError> =>
+    Effect.suspend(() => {
+      const seconds = relayAnswered ? busyRelayReadSeconds : unknownRelayReadSeconds
+      return executeUnauthorized("/version", HttpClientRequest.get(new URL("/version", endpoint)), endpoint).pipe(
+        Effect.flatMap((response) => readBody(response, "/version").pipe(
+          // A draining relay can cut this body as it stops; with its relay.json gone, this is that relay leaving.
+          Effect.mapError((error) => state !== undefined && liveRelayState() === undefined ? transportError("/version", endpoint)(error) : error),
+          Effect.map((body) => ({ response, body })),
+        )),
+        Effect.flatMap(({ response, body }): Effect.Effect<VerifiedEndpoint, RelayClientError> => {
+          const reply = typeof body === "object" && body !== null ? body as Record<string, unknown> : undefined
+          // A relay that is still starting answers 503 like handleResponse does, not as another program.
+          if (response.status === 503 && reply?.code === "relay-starting") {
+            const envelope = decodeErrorEnvelope(body)
+            return Effect.fail(new RelayRejected({
+              message: Option.isSome(envelope) ? envelope.value.error : "Relay responded with HTTP 503 for /version",
+              status: 503,
+              path: "/version",
+              code: "relay-starting",
+            }))
+          }
+          if (
+            response.status !== 200 ||
+            typeof reply?.version !== "string" ||
+            typeof reply.instanceId !== "string"
+          ) return Effect.fail(notBrowse(endpoint, body))
+          // A live relay.json for this install is authoritative: the verified port and instance must be exactly its.
+          const after = liveRelayState()
+          if (state !== undefined && after === undefined) return Effect.fail(transportError("/version", endpoint)(body))
+          if (state !== undefined && !sameLiveState(state, after)) return Effect.fail(notBrowse(endpoint, body))
+          if (after !== undefined && (after.port !== Number(new URL(endpoint).port) || after.instanceId !== reply.instanceId))
+            return Effect.fail(notBrowse(endpoint, body))
+          return Effect.succeed({ endpoint, instanceId: reply.instanceId, recorded: after?.instanceId })
+        }),
+        Effect.timeoutOrElse({
+          duration: `${seconds} seconds`,
+          orElse: () => Effect.fail(new RelayTimedOut({
+            message: `The relay on port ${new URL(endpoint).port} isn't answering (/version timed out after ${seconds}s).`, path: "/version",
+          })),
+        }),
+      )
+    })
+
+  const ensureVerified = (endpoint: string): Effect.Effect<void, RelayClientError> => {
+    const state = liveRelayState()
+    const port = Number(new URL(endpoint).port)
+    // A proof is reused only for the same live relay.json state: a live file for this port and instance, or no live
+    // file at proof time and still none. Anything else re-probes (and then fails if the file names another relay).
+    if (
+      verified?.endpoint === endpoint &&
+      ((state !== undefined && state.port === port && state.instanceId === verified.instanceId) ||
+        (state === undefined && verified.recorded === undefined))
+    ) return Effect.void
+    return verifyEndpoint(endpoint, state).pipe(Effect.tap((value) => Effect.sync(() => { verified = value })), Effect.asVoid)
+  }
+
+  /**
+   * A request that carries the relay token, after the very endpoint in its URL proved itself. The endpoint is never
+   * resolved again here: a relay.json change between building the request and sending it must not move the token (or
+   * the proof) to another port. A transport failure drops the proof.
+   */
+  const executeAuthorized = (endpoint: string, path: string, request: HttpClientRequest.HttpClientRequest) =>
+    Effect.suspend(() => {
+      // The request's own origin is the only place this token may go.
+      const target = new URL(request.url).origin
+      if (target !== new URL(endpoint).origin) {
+        return Effect.fail(new RelayDecodeFailed({
+          message: `Refusing to send the relay request for ${path} to ${target}: it was built for ${endpoint}.`,
+          path,
+          cause: request.url,
+        }))
+      }
+      return ensureVerified(target).pipe(
+        Effect.flatMap(() => httpClient.execute(authorize(request))),
+        Effect.mapError((error) => isRelayClientError(error) ? error : transportError(path)(error)),
+        Effect.tap(() => Effect.sync(() => { relayAnswered = true })),
+        Effect.tapError((error) => Effect.sync(() => {
+          if (error instanceof RelayUnreachable && verified?.endpoint === target) verified = undefined
+        })),
+      )
+    })
+
+  const requestJson = <A>(
+    path: string,
+    schema: Schema.ConstraintDecoder<A>,
+  ): Effect.Effect<{ readonly value: A; readonly endpoint: string }, RelayClientError> =>
+    Effect.suspend(() => {
+      const endpoint = currentEndpoint()
+      const seconds = relayAnswered ? busyRelayReadSeconds : unknownRelayReadSeconds
+      const request = HttpClientRequest.get(new URL(path, endpoint))
+      const send = path === "/version" ? executeUnauthorized(path, request) : executeAuthorized(endpoint, path, request)
+      return send.pipe(
+        Effect.flatMap((response) => handleResponse(response, path, schema).pipe(
+          Effect.map((value) => ({ value, endpoint })),
+        )),
+        Effect.timeoutOrElse({ duration: `${seconds} seconds`, orElse: () => Effect.fail(new RelayTimedOut({
+          message: `The relay on port ${new URL(endpoint).port} isn't answering (${path} timed out after ${seconds}s).`, path,
+        })) }),
+      )
+    })
+
+  const getJson = <A>(path: string, schema: Schema.ConstraintDecoder<A>): Effect.Effect<A, RelayClientError> =>
+    requestJson(path, schema).pipe(Effect.map(({ value }) => value))
 
   // Writes can legitimately wait for a human handoff or a command with no deadline. Probe the relay while waiting,
   // rather than shortening those operations or retrying a write whose outcome we don't know.
@@ -262,19 +411,21 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
     path: string,
     body: Record<string, unknown>,
     schema: Schema.ConstraintDecoder<A>,
-  ): Effect.Effect<A, RelayClientError> => HttpClientRequest.post(new URL(path, endpoint)).pipe(
-    HttpClientRequest.bodyJson(body),
-    Effect.mapError((cause) => new RelayEncodeFailed({
-      message: `Could not encode relay request for ${path}`,
-      path,
-      cause,
-    })),
-    Effect.flatMap((request) => httpClient.execute(authorize(request)).pipe(
-      Effect.mapError(transportError(path)),
-      Effect.flatMap((response) => handleResponse(response, path, schema)),
-      Effect.raceFirst(checkWhileWaiting),
-    )),
-  )
+  ): Effect.Effect<A, RelayClientError> => Effect.suspend(() => {
+    const endpoint = currentEndpoint()
+    return HttpClientRequest.post(new URL(path, endpoint)).pipe(
+      HttpClientRequest.bodyJson(body),
+      Effect.mapError((cause) => new RelayEncodeFailed({
+        message: `Could not encode relay request for ${path}`,
+        path,
+        cause,
+      })),
+      Effect.flatMap((request) => executeAuthorized(endpoint, path, request).pipe(
+        Effect.flatMap((response) => handleResponse(response, path, schema)),
+        Effect.raceFirst(checkWhileWaiting),
+      )),
+    )
+  })
 
   const recordingTargetBody = (target: { readonly sessionId?: string | undefined; readonly tabId?: number | undefined }): Record<string, unknown> => ({
     ...(target.sessionId ? { sessionId: target.sessionId } : {}),
@@ -294,11 +445,44 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
   }
 
   return Service.of({
-    endpoint,
-    version: getJson("/version", RelayVersion).pipe(Effect.mapError((error) =>
-      error instanceof RelayDecodeFailed || (error instanceof RelayRejected && !error.code && error.status === 404)
-        ? new RelayDecodeFailed({ message: `Relay port ${new URL(endpoint).port} is in use by another program (not a browse /version response).`, path: "/version", cause: error })
-        : error)),
+    get endpoint() {
+      return currentEndpoint()
+    },
+    version: Effect.suspend(() => {
+      const state = liveRelayState()
+      const probed = currentEndpoint()
+      // Map transport/decode/404 failures only: a parsed body without instanceId or with a mismatched instance below is
+      // another program, whatever relay.json did.
+      const probe = requestJson("/version", RelayVersion).pipe(
+        Effect.mapError((error) => {
+          if (!(error instanceof RelayDecodeFailed || (error instanceof RelayRejected && !error.code && error.status === 404))) return error
+          // A draining relay can cut this response as it stops; if its relay.json went with it, this is that relay
+          // leaving, not another program holding the port.
+          return state !== undefined && liveRelayState() === undefined
+            ? transportError("/version", probed)(error)
+            : notBrowse(probed, error)
+        }),
+      )
+      return probe.pipe(
+        // Another product on the port (Playwriter answers `{ version }` alone): without browse's instanceId this is not
+        // a browse relay, and must never be mistaken for one. Same path as any other foreign listener.
+        Effect.flatMap(({ value: version, endpoint }): Effect.Effect<RelayVersion, RelayClientError> => {
+          const instanceId = version.instanceId
+          if (typeof instanceId !== "string") return Effect.fail(notBrowse(endpoint, version))
+          const after = liveRelayState()
+          if (state !== undefined && after === undefined) return Effect.fail(transportError("/version", endpoint)(version))
+          if (state !== undefined && !sameLiveState(state, after)) return Effect.fail(notBrowse(endpoint, version))
+          if (after !== undefined && (after.port !== Number(new URL(endpoint).port) || after.instanceId !== instanceId))
+            return Effect.fail(notBrowse(endpoint, version))
+          // The open /version just proved this endpoint, so an authorized request may use it without probing again.
+          // relay.json's instance is stored with the proof, so its later disappearance forces a new probe.
+          return Effect.sync(() => {
+            verified = { endpoint, instanceId, recorded: after?.instanceId }
+            return version
+          })
+        }),
+      )
+    }),
     shutdown: (request) => postJson("/shutdown", { ...request }, RelayShutdownResponse),
     extensionStatus: getJson("/extension/status", ExtensionStatus),
     targets: getJson("/json/list", TargetSummaries),
@@ -308,6 +492,7 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
         ...(id ? { id } : {}),
         ...(options?.readOnly ? { readOnly: true } : {}),
         ...(options?.allowedOrigins && options.allowedOrigins.length > 0 ? { allowedOrigins: [...options.allowedOrigins] } : {}),
+        ...(options?.keepVisible ? { keepVisible: true } : {}),
         ...(options?.browser ? { browser: options.browser } : {}),
       }, SessionContainer).pipe(Effect.map((container) => container.session)),
     sessionAllowlist: (id, allowedOrigins) =>
@@ -335,23 +520,15 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
     networkStatus: (request) => postJson("/network/status", { ...request }, NetworkStatusResponse),
     networkStop: (request) => postJson("/network/stop", { ...request }, NetworkStopResponse),
     networkCancel: (request) => postJson("/network/cancel", { ...request }, NetworkCancelResponse),
-    authStatus: (request) => postJson("/auth/status", { ...request }, AuthProfileSummary),
-    authRefresh: (request) => postJson("/auth/refresh", { ...request }, NetworkStopResponse),
-    authRun: (request) => postJson("/auth/run", { ...request }, AuthRunResponse),
     recordingStart: ({ sessionId, tabId, ...request }) =>
       postJson("/recording/start", { ...recordingTargetBody({ sessionId, tabId }), ...request }, RecordingStartResponse),
     recordingStop: (target) => postJson("/recording/stop", recordingTargetBody(target), RecordingStopResponse),
     recordingStatus: (target) => getJson(`/recording/status${recordingTargetQuery(target)}`, RecordingStatusResponse),
     recordingCancel: (target) => postJson("/recording/cancel", recordingTargetBody(target), RecordingCancelResponse),
-    tabsCleanup: (idleMinutes) => postJson("/tabs/cleanup", idleMinutes === undefined ? {} : { idleMinutes }, TabsCleanupResponse),
+    tabsCleanup: (idleMinutes, sessions) =>
+      postJson("/tabs/cleanup", { ...(idleMinutes === undefined ? {} : { idleMinutes }), ...(sessions ? { sessions } : {}) }, TabsCleanupResponse),
     settingsGet: getJson("/settings", SettingsGetResponse),
     settingsSet: (changes) => postJson("/settings", { set: changes }, SettingsSetResponse),
-    flightRecorderStart: ({ sessionId, tabId, ...request }) =>
-      postJson("/flight-recorder/start", { ...recordingTargetBody({ sessionId, tabId }), ...request }, FlightRecorderStatusResponse),
-    flightRecorderStatus: (target) => getJson(`/flight-recorder/status${recordingTargetQuery(target)}`, FlightRecorderStatusResponse),
-    flightRecorderSaveLast: ({ sessionId, tabId, ...request }) =>
-      postJson("/flight-recorder/save-last", { ...recordingTargetBody({ sessionId, tabId }), ...request }, FlightRecorderSaveResponse),
-    flightRecorderCancel: (target) => postJson("/flight-recorder/cancel", recordingTargetBody(target), FlightRecorderCancelResponse),
   })
 })
 
@@ -361,12 +538,12 @@ const layer: Layer.Layer<Service, RelayConfigInvalid, HttpClient.HttpClient> = L
 export const layerFetch: Layer.Layer<Service, RelayConfigInvalid> = layer.pipe(Layer.provide(NodeHttpClient.layerNodeHttp))
 
 /**
- * The process the relay watches for this MCP server: the MCP supervisor when it runs one (it outlives
- * the servers it swaps on an update, so the session and its tabs survive), else this process.
+ * The process the relay watches for this MCP server: an older install's supervisor when it started this server
+ * (it outlives the server it swaps on an update, so the session and its tabs survive), else this process.
  */
 function mcpClientPid(): number {
-  const shim = Number(process.env.OPENCODE_BROWSER_CLIENT_PID)
-  return Number.isSafeInteger(shim) && shim > 1 && shim === process.ppid ? shim : process.pid
+  const supervisor = Number(process.env.OPENCODE_BROWSER_CLIENT_PID)
+  return Number.isSafeInteger(supervisor) && supervisor > 1 && supervisor === process.ppid ? supervisor : process.pid
 }
 
 /** layerFetch for the MCP server, which names its process to the relay (see `make`). */

@@ -2,38 +2,52 @@ import crypto from "node:crypto"
 import path from "node:path"
 import { Config, Effect, Option } from "effect"
 import type { WebSocket } from "ws"
+import { createAutoUpdater, installedRuntime } from "./update/auto-update.ts"
 import { BrowserLinks, type BrowserLink } from "./relay/browser-links.ts"
 import { CdpClientPool } from "./cdp/client-pool.ts"
+import { clearDeviceMetricsOverride, DeviceMetricsOverrides, tabsToClearOnExecuteEnd } from "./cdp/emulation.ts"
 import { CdpRouter } from "./cdp/router.ts"
 import { CdpRuntime } from "./cdp/runtime.ts"
+import { installedDevExtension, syncDevExtension } from "./setup/dev-extension.ts"
 import { ExecuteSandbox } from "./execute.ts"
 import { pruneStaleExecuteFilesDirectories } from "./execute-realm.ts"
-import { FlightRecorderRelay } from "./recording-relay/flight-recorder.ts"
-import { GhostCursorTabs } from "./ghost-cursor.ts"
 import { HandoffRegistry } from "./session-manager/handoff.ts"
 import { createHttpRequestHandler } from "./http-api.ts"
 import { forgetTab } from "./execute/human-input.ts"
-import { stateRoot, storeConfig } from "./paths.ts"
+import { devExtension, PUBLIC_STORE_ID, stateRoot, storeConfig } from "./paths.ts"
 import { ProtectedFrameTracker } from "./cdp/protected-frames.ts"
-import type { CdpEvent, JsonObject } from "./protocol.ts"
+import { extensionCapabilityTabRelease, type CdpEvent, type JsonObject } from "./protocol.ts"
 import { RecordingRelay } from "./recording-relay.ts"
 import { relayHostname } from "./relay/config.ts"
 import {
   closeHttpServer,
   closeWebSocketServer,
-  defaultPort,
+  createTargetUrl,
   formatHostForUrl,
   getNumber,
+  getString,
+  getTargetInfo,
+  isRestrictedTarget,
   listenHttpServer,
   logCloseError,
   sendCdpEvent,
 } from "./relay/helpers.ts"
 import { appendRelayLifecycleEvent, RelayLifecycleEvent } from "./relay/lifecycle-log.ts"
 import { relayLog } from "./relay/log.ts"
+import { configuredTimeoutMs, extensionCommandTimeout, extensionPingTimeout } from "./relay/rpc.ts"
+import {
+  chooseRelayPort,
+  configuredRelayPort,
+  relayPortPinned,
+  removeRelayState,
+  writeLastRelayPort,
+  writeRelayState,
+} from "./relay/port.ts"
 import { ensurePrivateDirectory, relayToken } from "./relay/secrets.ts"
 import type { ChildTarget, ConnectedTarget } from "./relay/types.ts"
 import { createCdpDispatcher } from "./relay/cdp-dispatch.ts"
-import { createExtensionCommands } from "./relay/commands.ts"
+import { createExtensionCommands, isMissingTabError } from "./relay/commands.ts"
+import { navigateTopFrameToDataUrl } from "./relay/data-navigation.ts"
 import { createExtensionEventHandler } from "./relay/extension-events.ts"
 import { ExtensionHandshake } from "./relay/extension-handshake.ts"
 import { installRelayProcessGuard, targetDiagnosticIdentity } from "./relay/process-guard.ts"
@@ -44,7 +58,7 @@ import { createRelayTransportServers } from "./relay/transport-server.ts"
 import { RootTargetLifecycle } from "./cdp/root-target-lifecycle.ts"
 import { defaultSessionCatalogPath, SessionCatalog } from "./session-manager/catalog.ts"
 import { appendJournalEntry, defaultJournalBaseDir, makeJournalEntry } from "./session-manager/journal.ts"
-import { defaultExecuteTimeoutMs, OpenCodeBrowserSessions } from "./session-manager.ts"
+import { defaultShutdownTimeoutMs, OpenCodeBrowserSessions } from "./session-manager.ts"
 import { SessionNavigationGuard } from "./session-manager/navigation-guard.ts"
 import { TabActivity } from "./cdp/tab-activity.ts"
 import { TargetRegistry, type RootTargetChange, type TargetOwnershipChange } from "./cdp/target-registry.ts"
@@ -57,8 +71,19 @@ export {
   shouldSuppressRelayProcessFault,
 } from "./relay/process-guard.ts"
 
+/**
+ * OPENCODE_BROWSER_EXECUTE_TIMEOUT_MS when the relay was given one: the default budget for an execute that didn't
+ * choose its own, and the action budget that comes with it. Unset keeps the 60s fallback in session-manager.
+ */
+export const configuredExecuteTimeoutMs = Config.Int("OPENCODE_BROWSER_EXECUTE_TIMEOUT_MS").pipe(
+  Config.option,
+  Config.map(Option.getOrUndefined),
+)
+
 export const startRelay = Effect.fn("Relay.start")(function* (options: {
   readonly port?: number
+  /** Test-only: replaces the fallback candidate list so tests never touch the real 19988–19997 range. */
+  readonly portCandidates?: readonly number[]
   readonly releaseTargetGraceMs?: number
   readonly sessionCatalogPath?: string | null
   readonly additionalExtensionOrigins?: readonly string[]
@@ -69,22 +94,35 @@ export const startRelay = Effect.fn("Relay.start")(function* (options: {
 
 const makeRelay = Effect.fnUntraced(function* (options: {
   readonly port?: number
+  readonly portCandidates?: readonly number[]
   readonly releaseTargetGraceMs?: number
   readonly sessionCatalogPath?: string | null
   readonly additionalExtensionOrigins?: readonly string[]
 } = {}) {
   const listenHost = relayHostname()
   const host = "127.0.0.1"
-  const port = options.port ?? defaultPort
+  // The configured port names this install's state; the listen port may be a fallback (relay/port.ts).
+  const configuredPort = options.port ?? configuredRelayPort()
+  const port = yield* Effect.tryPromise({
+    try: () => chooseRelayPort({
+      configuredPort,
+      pinned: options.port !== undefined || relayPortPinned(),
+      host: listenHost,
+      ...(options.portCandidates ? { candidates: options.portCandidates } : {}),
+    }),
+    catch: (cause) => cause instanceof Error ? cause : new Error("Choose the relay port", { cause }),
+  })
   const releaseTargetGraceMs = Math.max(0, options.releaseTargetGraceMs ?? 10_000)
   const browserId = crypto.randomUUID()
+  const startedAt = new Date().toISOString()
   const endpointUrl = `http://${formatHostForUrl(host)}:${port}`
   const additionalChromeExtensionOrigins = new Set(options.additionalExtensionOrigins ?? [])
-  const storeId = storeConfig().id
-  if (storeId) additionalChromeExtensionOrigins.add(`chrome-extension://${storeId}`)
+  // The store build installs from, for a checkout too: install points every channel at it (paths.ts PUBLIC_STORE_ID).
+  const storeId = storeConfig().id ?? PUBLIC_STORE_ID
+  additionalChromeExtensionOrigins.add(`chrome-extension://${storeId}`)
   const sessionCatalog = options.sessionCatalogPath === null
     ? undefined
-    : new SessionCatalog(options.sessionCatalogPath ?? defaultSessionCatalogPath(port))
+    : new SessionCatalog(options.sessionCatalogPath ?? defaultSessionCatalogPath(configuredPort))
   let catalogWritesEnabled = false
   const registry = new TargetRegistry()
   const authToken = yield* Effect.try({
@@ -94,8 +132,17 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     },
     catch: (cause) => new Error("Create the relay token", { cause }),
   })
-  const browsers = new BrowserLinks()
-  const { sendToExtension, sendExtensionBestEffort, sendToEach } = createExtensionCommands({ browsers })
+  const extensionTimeoutEnv = Option.getOrUndefined(yield* Config.option(Config.String("OPENCODE_BROWSER_EXTENSION_TIMEOUT_MS")))
+  const pingTimeoutEnv = Option.getOrUndefined(yield* Config.option(Config.String("OPENCODE_BROWSER_PING_TIMEOUT_MS")))
+  const extensionCommandTimeoutMs = configuredTimeoutMs(extensionTimeoutEnv, extensionCommandTimeout)
+  const extensionPingTimeoutMs = configuredTimeoutMs(pingTimeoutEnv, extensionPingTimeout)
+  const browsers = new BrowserLinks({
+    timeouts: {
+      commandTimeoutMs: extensionCommandTimeoutMs,
+      pingTimeoutMs: extensionPingTimeoutMs,
+    },
+  })
+  const { sendToExtension, sendExtensionBestEffort, sendToEveryBrowser, sendToEach, cleanupTabs } = createExtensionCommands({ browsers, registry, onTabGone: forgetMissingTab })
 
   const debugEnabled = yield* Config.Boolean("OPENCODE_BROWSER_DEBUG").pipe(Config.withDefault(false))
   const debugLog = debugEnabled ? (line: string) => console.error(`[bc ${new Date().toISOString().slice(11, 23)}] ${line}`) : undefined
@@ -128,9 +175,14 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     sendEvent: sendCdpEvent,
     ...(contextDebugLog ? { trace: contextDebugLog } : {}),
   })
+  // Assigned once housekeeping exists (below). A tab's last Fetch-interception owner going away releases it.
+  let releaseIdleInterception: (tabId: number) => void = () => undefined
+  const pendingInterceptionReleases = new Set<number>()
+  let interceptionReleaseScheduled = false
   const cdpClients = new CdpClientPool<WebSocket>(
     (client, event) => cdpRuntime.deliver(client, event),
     (client, sessionId) => cdpRuntime.detach(client, sessionId),
+    (tabId) => releaseIdleInterception(tabId),
   )
 
   const mainFrameIdsByTab = new Map<number, string>()
@@ -138,34 +190,18 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   const suppressedChildSessions = new Map<string, number>()
   const protectedFrames = new ProtectedFrameTracker()
   const handoffs = new HandoffRegistry()
-  const ownersAcrossReconnect = new Map<string, { readonly sessionId?: string; readonly owner: "relay" | "user"; readonly browser: string }>()
+  const ownersAcrossReconnect = new Map<string, { readonly sessionId?: string; readonly owner: "relay" | "user"; readonly browser: string; readonly deleted?: boolean }>()
   const sweptBrowsers = new Set<string>()
 
   const recordingRelay = new RecordingRelay({
-    sendToExtension: (command) => Effect.runPromise(sendToExtension(command)),
     sendDebuggerCommand: (command) => Effect.runPromise(sendDebuggerCommand(command)),
     isExtensionConnected: () => browsers.connected,
-    isTabUnavailable: (tabId) => flightRecorder.isActiveTab(tabId),
     onTabRecordingChanged: (tabId) => recordingChanged(tabId),
   })
-  const flightRecorder = new FlightRecorderRelay({
-    sendDebuggerCommand: (command) => Effect.runPromise(sendDebuggerCommand(command)),
-    isExtensionConnected: () => browsers.connected,
-    isTabRecording: (tabId) => recordingRelay.isRecordingTab(tabId),
-    onTabRecordingChanged: (tabId) => recordingChanged(tabId),
-  })
-  const isTabRecorded = (tabId: number) => recordingRelay.isRecordingTab(tabId) || flightRecorder.isActiveTab(tabId)
+  const isTabRecorded = (tabId: number) => recordingRelay.isRecordingTab(tabId)
 
-  const ghostCursorEnv = Option.getOrUndefined(yield* Config.option(Config.Boolean("OPENCODE_BROWSER_GHOST_CURSOR")))
-  const ghostCursorAlways = (tabId: number) => ghostCursorEnv ?? browsers.browserTab(tabId)?.link.cursor ?? false
   const agentWindowSetting = Option.getOrUndefined(yield* Config.option(Config.String("OPENCODE_BROWSER_AGENT_WINDOW")))?.trim().toLowerCase()
   const agentWindow = agentWindowSetting === "current" || agentWindowSetting === "separate" ? agentWindowSetting : undefined
-  const ghostCursor = new GhostCursorTabs({
-    send: sendDebuggerCommand,
-    mainFrameId: (tabId) => mainFrameIdsByTab.get(tabId),
-    shownByDefault: (tabId) =>
-      isTabRecorded(tabId) ? recordingRelay.showsGhostCursor(tabId) || flightRecorder.showsGhostCursor(tabId) : ghostCursorAlways(tabId),
-  })
 
   const tabActivity = new TabActivity((tabId, enabled) => sendDebuggerCommand({
     tabId,
@@ -194,7 +230,6 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   })
 
   const recordingChanged = async (tabId: number): Promise<void> => {
-    await ghostCursor.refresh([tabId])
     const pending = handoffs.pendingForTab(tabId)
     const target = registry.tabTargets.get(tabId)
     if (!pending || !target) return
@@ -209,8 +244,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     const mine = (tabId: number) => browsers.ownerKey(tabId) === key
     for (const target of [...registry.listRootTargets(), ...registry.listStagedRootTargets()]) {
       if (!mine(target.tabId)) continue
-      void recordingRelay.abortRecordingForTab({ tabId: target.tabId, reason }).catch(() => {})
-      void flightRecorder.cancel({ tabId: target.tabId }).catch(() => {})
+      void recordingRelay.abortRecordingForTab(target.tabId).catch(() => {})
       presentation.clearPendingTabGrouping(target.tabId)
       ownersAcrossReconnect.set(target.targetInfo.targetId, {
         browser: key,
@@ -235,10 +269,12 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     cdpClientCount: () => cdpClients.size,
   })
 
-  const executeTimeoutMs = yield* Config.Int("OPENCODE_BROWSER_EXECUTE_TIMEOUT_MS").pipe(Config.withDefault(defaultExecuteTimeoutMs))
+  const executeTimeoutMs = yield* configuredExecuteTimeoutMs
   const keepaliveIntervalMs = yield* Config.Int("OPENCODE_BROWSER_KEEPALIVE_MS").pipe(Config.withDefault(20_000))
   const idleTabTtlMs = yield* Config.Int("OPENCODE_BROWSER_IDLE_TAB_TTL_MS").pipe(Config.withDefault(15 * 60_000))
   const journalBaseDir = defaultJournalBaseDir()
+  // Tabs that received a device-metrics override; the execute end clears only these.
+  const deviceMetricsOverrides = new DeviceMetricsOverrides()
 
   // The sandbox wiring stays here: it closes over `sessions` itself and over `navigationGuard`, declared below.
   const sessions: OpenCodeBrowserSessions = new OpenCodeBrowserSessions(
@@ -249,8 +285,8 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         authToken,
         sessionId: id,
         onDefaultTargetChange,
-        allowedOrigins: () => sessions.allowedOrigins(id),
         drainGuardWarnings: () => navigationGuard.drainWarnings(id),
+        cpuScheduler: sessions.cpuScheduler,
         isRecordingTarget: (targetId) => {
           const target = registry.targetsByTargetId.get(targetId)
           return target !== undefined && isTabRecorded(target.tabId)
@@ -278,8 +314,51 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       getUserAttachedPageUrls: (session) => registry.listRootTargets()
         .filter((target) => target.owner === "user" && browsers.ownerKey(target.tabId) === session.browser?.key)
         .map((target) => target.targetInfo.url || "about:blank"),
-      executeTimeoutMs,
-      onExecuteStateChange: (sessionId, executing) => presentation.onSessionExecuteStateChange(sessionId, executing),
+      // A stopped script may be awaiting a navigation whose server never answers. The caller and the execute lock
+      // are released at once, but Chromium still has Page.navigate in flight on the tab and queues every
+      // renderer-bound command behind it (including the next execute's connectOverCDP), so end it browser-side.
+      // Only tabs the session owns: a tab it merely drove through target selection may be another session's or the user's.
+      onStoppingExecute: (session) => {
+        if (session.readOnly) return Effect.void
+        const tabs = registry.listRootTargets().filter((target) => target.opencodeBrowserSessionId === session.id)
+        if (tabs.length === 0) return Effect.void
+        return Effect.forEach(tabs, (target) =>
+          sendDebuggerCommand({ tabId: target.tabId, method: "Page.stopLoading", params: {} }).pipe(
+            Effect.timeoutOption("2 seconds"),
+            Effect.ignore,
+          ), { concurrency: "unbounded", discard: true })
+      },
+      ...(executeTimeoutMs === undefined ? {} : { executeTimeoutMs }),
+      onExecuteStateChange: (sessionId, executing) => Effect.gen(function* () {
+        yield* presentation.onSessionExecuteStateChange(sessionId, executing)
+        if (executing) return
+        // A viewport emulated on a tab outlives the script that set it: the tab stays letterboxed
+        // until the debugger detaches. Clear the tabs this session's script set an override on,
+        // owned or just driven through target selection, which also covers raw CDP overrides. This
+        // runs inline under the session's execute semaphore, so nothing is left for the next call.
+        const tabs = tabsToClearOnExecuteEnd({
+          overrides: deviceMetricsOverrides,
+          readOnly: sessions.isReadOnly(sessionId),
+          sessionId,
+          canSee: (tabId) => {
+            const target = registry.tabTargets.get(tabId)
+            return target !== undefined && cdpRouter.canSessionSeeTarget(sessionId, target)
+          },
+        })
+        for (const { tabId, generation } of tabs) {
+          if (!deviceMetricsOverrides.isCurrent(tabId, generation)) continue
+          yield* clearDeviceMetricsOverride(
+            (method, params) => sendDebuggerCommand({ tabId, method, params }),
+            { retry: () => deviceMetricsOverrides.isCurrent(tabId, generation) },
+          ).pipe(Effect.timeoutOption("2 seconds"), Effect.ignore)
+        }
+      }),
+      // A deleted or reset session's tabs are gone; drop its ownership so another session's clear isn't
+      // skipped by an owner that will never run again, and release any tab the session kept visible.
+      onSessionDeleted: (sessionId) => {
+        deviceMetricsOverrides.take(sessionId)
+        void Effect.runPromise(Effect.ignore(tabActivity.release(sessionId))).catch(() => {})
+      },
       onExecuteRecord: (record) => {
         const entry = makeJournalEntry({
           sessionId: record.sessionId,
@@ -298,6 +377,13 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         return appendJournalEntry({ baseDir: journalBaseDir, entry })
       },
       onTargetOwnershipChange: (change) => reconcileTargetOwnership(change),
+      onTargetCleared: (sessionId, targetId, reason) => relayLog("session.target.cleared", { session: sessionId, target: targetId, reason }),
+      onRestoreWarning: (detail) => relayLog("session.restore.dropped", { detail }),
+      onTombstoneRelayTargets: (sessionId, targetIds, browserKey) => {
+        for (const targetId of targetIds) {
+          ownersAcrossReconnect.set(targetId, { browser: browserKey ?? "", owner: "relay", sessionId, deleted: true })
+        }
+      },
       onReleaseRelayTarget: (targetId) => releaseRelayTarget(targetId),
       getTargets: () => registry.listRootTargets(),
       relayTargetIdsForSession: (sessionId) => [
@@ -305,10 +391,14 @@ const makeRelay = Effect.fnUntraced(function* (options: {
           .filter((target) => target.owner === "relay" && target.opencodeBrowserSessionId === sessionId)
           .map((target) => target.targetInfo.targetId),
         ...Array.from(ownersAcrossReconnect)
-          .filter(([targetId, known]) => known.owner === "relay" && known.sessionId === sessionId && !registry.targetsByTargetId.has(targetId))
+          .filter(([targetId, known]) => known.deleted !== true && known.owner === "relay" && known.sessionId === sessionId && !registry.targetsByTargetId.has(targetId))
           .map(([targetId]) => targetId),
       ],
       onCancelSessionHandoff: (sessionId) => handoffs.cancelForSession(sessionId) !== undefined,
+      pendingHandoff: (sessionId) => {
+        const pending = handoffs.pendingForSession(sessionId)
+        return pending ? { message: pending.message, tabId: pending.tabId, startedAt: pending.startedAt } : undefined
+      },
       onSessionsChanged: async (entries) => {
         if (catalogWritesEnabled) await sessionCatalog?.save(entries)
       },
@@ -331,23 +421,53 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       if (target?.owner === "user") return
       relayLog("allowlist.close", { tabId, registered: target !== undefined })
       yield* sendToExtension({ method: "tabs.remove", params: { tabId } })
-      if (target) detachTargetState(tabId)
+      if (target) detachTargetState(tabId, { reason: "navigation-blocked" })
     })),
     log: (event, details) => relayLog(event, details),
   })
 
-  const ownerAcrossReconnect = (targetId: string) => {
+  const ownerAcrossReconnect = (targetId: string, includeRelayOwnership: boolean, browserKey: string | undefined) => {
     const known = ownersAcrossReconnect.get(targetId)
-    return known?.sessionId !== undefined && sessions.sessions.has(known.sessionId)
+    if (!known || known.deleted === true) return undefined
+    if (browserKey !== undefined && known.browser !== "" && known.browser !== browserKey) return undefined
+    if (!includeRelayOwnership && known.owner !== "user") return undefined
+    return known.sessionId !== undefined && sessions.sessions.has(known.sessionId)
       ? { sessionId: known.sessionId, owner: known.owner }
       : undefined
   }
 
+  // An attach command may run on an existing tab that is still loading, so it gets more time than the reconnect inventory.
+  const attachTimeoutMs = yield* Config.Int("OPENCODE_BROWSER_ATTACH_TIMEOUT_MS").pipe(Config.withDefault(10_000))
+
   const rootLifecycle = yield* RootTargetLifecycle.make({
     registry,
     sessions: {
-      persistedTargetOwner: (targetId) => sessions.persistedTargetOwner(targetId) ?? ownerAcrossReconnect(targetId),
+      persistedTargetOwner: (targetId, restoreOptions) =>
+        sessions.persistedTargetOwner(targetId, restoreOptions) ??
+        ownerAcrossReconnect(
+          targetId,
+          restoreOptions?.legacy === true || restoreOptions?.includeHeldTargets !== false,
+          restoreOptions?.browserKey,
+        ),
       markTargetReplaced: (previousTargetId, targetId) => sessions.markTargetReplaced(previousTargetId, targetId),
+      noteTargetHeld: (targetId, sessionId) => sessions.noteTargetHeld(targetId, sessionId),
+      forgetTargetHeld: (targetId) => sessions.forgetTargetHeld(targetId),
+    },
+    browserKeyForTab: (tabId) => browsers.ownerKey(tabId),
+    authorizeRestoredTarget: ({ tabId, targetId, url, owner, sessionId }) => {
+      // Like a popup or a created tab: the session's allowlist decides before the page is published for it.
+      const allowed = navigationGuard.createdTabNavigated({
+        tabId,
+        opencodeBrowserSessionId: sessionId,
+        owner,
+        targetInfo: { targetId, url },
+      })
+      if (!allowed) {
+        relayLog("allowlist.reclaim-refused", { tabId, session: sessionId })
+        sessions.markTargetDetached(targetId, { reason: "allowlist-reclaim" })
+        sessions.forgetTargetHeld(targetId)
+      }
+      return allowed
     },
     handoffs,
     clients: cdpClients,
@@ -355,6 +475,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       generation: (tabId) => browsers.generationOf(tabId),
       isCurrentGeneration: (generation) => browsers.isCurrentGeneration(generation),
       send: (command) => sendToExtension(command),
+      supportsTargetRelease: (tabId) => browsers.browserTab(tabId)?.link.rpc.supports(extensionCapabilityTabRelease) ?? false,
     },
     presentation: {
       replaced: recordRootReplacement,
@@ -363,13 +484,12 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       announceChild: announceAttachedChildTarget,
     },
     reportError: (message, error) => console.error(message, error),
+    attachCommandTimeoutMs: attachTimeoutMs,
   })
 
   const settingsSync = createRelaySettingsSync({
     browsers,
     handshake,
-    ghostCursor,
-    ghostCursorEnv,
     agentWindow,
     sendToExtension,
     sendExtensionBestEffort,
@@ -379,7 +499,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   const restartTimeoutMs = yield* Config.Int("OPENCODE_BROWSER_RESTART_TIMEOUT_MS").pipe(Config.withDefault(10_000))
   const clientGoneGraceMs = yield* Config.Int("OPENCODE_BROWSER_CLIENT_GONE_GRACE_MS").pipe(Config.withDefault(60_000))
   const restartRequestId = yield* Config.option(Config.String("OPENCODE_BROWSER_RESTART_REQUEST_ID"))
-  const lifecycleLogPath = path.join(stateRoot(), "relays", String(port), "lifecycle.jsonl")
+  const lifecycleLogPath = path.join(stateRoot(), "relays", String(configuredPort), "lifecycle.jsonl")
   const audit = (event: RelayLifecycleEvent) => Effect.try(() => appendRelayLifecycleEvent(lifecycleLogPath, event))
 
   function setProtectedUi(tabId: number, protectedUi: boolean): void {
@@ -391,7 +511,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
 
   const detachTab = Effect.fnUntraced(function* (tabId: number) {
     yield* sendToExtension({ method: "debugger.detach", params: { tabId } })
-    detachTargetState(tabId)
+    detachTargetState(tabId, { reason: "relay-detached" })
     yield* Effect.ignore(sendToExtension({ method: "action.setAttached", params: { tabId, attached: false } }))
   })
 
@@ -412,19 +532,48 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     activeHandoffTabs: presentation.activeHandoffTabs,
     tabActivity,
     recordingRelay,
-    flightRecorder,
     rootLifecycle,
-    sendToExtension,
+    closeTargetByTargetId: (targetId) => closeTargetByTargetId(targetId),
+    sendToEveryBrowser,
     isTabRecorded,
     detachTab,
     audit,
   })
-  const { shutdown: shutdownControl, releaseRelayTarget, startTimers, stopTimers } = housekeeping
+  const { shutdown: shutdownControl, updates, sendUpdateNotice, releaseRelayTarget, browserIdle, startTimers, stopTimers } = housekeeping
+
+  releaseIdleInterception = (tabId) => {
+    // Shutdown releases every tab from cleanup() while the extension link is still open, and the unregister that
+    // dropped this owner happened while stopping: don't start a second release the cleanup cannot wait for.
+    if (shutdownControl.stopping) return
+    pendingInterceptionReleases.add(tabId)
+    if (interceptionReleaseScheduled) return
+    interceptionReleaseScheduled = true
+    // A client can lose several tabs at once (closing it, or pruning its announcements); release them as one batch so
+    // the runtime's small concurrency limit covers all of them and each command stays bounded.
+    queueMicrotask(() => {
+      interceptionReleaseScheduled = false
+      if (shutdownControl.stopping) {
+        pendingInterceptionReleases.clear()
+        return
+      }
+      const tabs = Array.from(pendingInterceptionReleases).filter((id) => !cdpClients.hasInterceptionOwners(id))
+      pendingInterceptionReleases.clear()
+      if (tabs.length === 0) return
+      // The per-command bound is 3 seconds; the whole release must finish well inside the 10 second restart drain.
+      Effect.runPromise(shutdownControl.trackTransport(cdpRuntime.releaseInterception(
+        tabs,
+        (id) => !cdpClients.hasInterceptionOwners(id),
+      ).pipe(Effect.timeoutOption("3 seconds"), Effect.ignore))).catch((error: unknown) => {
+        console.error("Failed to release request interception", error)
+      })
+    })
+  }
 
   const toggleTab = Effect.fnUntraced(function* (tabId: number) {
     if (registry.tabTargets.has(tabId)) return yield* detachTab(tabId)
     announceTab(tabId)
-    yield* rootLifecycle.attach({ tabId, owner: "user" })
+    // A lend is the user's: it restores no persisted owner, and finish drops any stale held-target hint for it.
+    yield* rootLifecycle.attach({ tabId, owner: "user", restoreOwnership: false })
   })
 
   const sessionBrowser = (sessionId: string | undefined): Effect.Effect<BrowserLink, Error> => Effect.suspend(() => {
@@ -447,24 +596,70 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     readonly autoAttachParams?: JsonObject
   }) {
     const link = yield* sessionBrowser(createOptions.opencodeBrowserSessionId)
-    const result = yield* sendToExtension({ method: "tabs.create", params: { url: createOptions.url, active: createOptions.active, ...(agentWindow ? { window: agentWindow } : {}) } }, link)
+    // Create the tab blank and navigate only after attaching: the navigation guard then sees the real load (a tab
+    // created at the URL would load it before any debugger was attached), and Vivaldi never has to answer commands
+    // on a tab that is still loading.
+    const result = yield* sendToExtension({ method: "tabs.create", params: { url: "about:blank", active: createOptions.active, ...(agentWindow ? { window: agentWindow } : {}) } }, link)
     const tabId = getNumber(result, "tabId")
     if (!tabId) return yield* Effect.fail(new Error("tabs.create did not return a tabId"))
     announceTab(tabId)
-    return yield* rootLifecycle.attach({
+    const target = yield* rootLifecycle.attach({
       tabId,
       owner: "relay",
       ...(createOptions.opencodeBrowserSessionId ? { opencodeBrowserSessionId: createOptions.opencodeBrowserSessionId } : {}),
       ...(createOptions.autoAttachParams ? { autoAttachParams: createOptions.autoAttachParams } : {}),
-    })
+      // The created tab's allowlist check runs below; record it only once that check has passed.
+      deferHeldTarget: true,
+    }).pipe(
+      // The tab exists for this createTarget alone: a failed attach must not leave an unattached blank tab behind.
+      Effect.tapError((error) => Effect.sync(() => {
+        relayLog("create.attach-failed", { tabId, error: error instanceof Error ? error.message : String(error) })
+        sendExtensionBestEffort({ method: "tabs.remove", params: { tabId } })
+        detachTargetState(tabId, { reason: "attach-failed" })
+      })),
+    )
+    const requested = createTargetUrl({ url: createOptions.url })
+    let heldAllowed = true
+    const finishCreatedTarget = (created: ConnectedTarget) => {
+      if (heldAllowed && createOptions.opencodeBrowserSessionId) sessions.noteTargetHeld(created.targetInfo.targetId, createOptions.opencodeBrowserSessionId)
+      return created
+    }
+    if (requested !== "about:blank") {
+      const data = /^data:/i.test(requested.trim())
+      const navigation = yield* (
+        data
+          ? navigateTopFrameToDataUrl({ tabId, params: { url: requested }, mainFrameIdsByTab, blankNavigationWaiters, registry, sendDebuggerCommand })
+          : sendDebuggerCommand({ tabId, method: "Page.navigate", params: { url: requested } })
+      ).pipe(
+        // A failed navigation must not fail the create and leak an announced tab; Chrome answers createTarget anyway.
+        Effect.catch((error) => Effect.sync(() => {
+          relayLog("create.navigate-failed", { tabId, error: error instanceof Error ? error.message : String(error) })
+          return undefined
+        })),
+      )
+      const errorText = getString(navigation, "errorText")
+      if (errorText) relayLog("create.navigate-failed", { tabId, errorText })
+      else if (data && navigation === undefined) relayLog("create.data-skipped", { tabId })
+      // Defense in depth: check where the tab actually ended up, in case its load beat the guard's events. A
+      // disallowed result is blanked here like any other agent tab; only a URL this check allows reaches the registry.
+      const current = yield* sendDebuggerCommand({ tabId, method: "Target.getTargetInfo", params: {} }).pipe(Effect.orElseSucceed((): JsonObject => ({})))
+      const targetInfo = getTargetInfo(current.targetInfo)
+      heldAllowed = !targetInfo || isRestrictedTarget(targetInfo) || navigationGuard.createdTabNavigated({ ...target, targetInfo })
+      if (targetInfo && !isRestrictedTarget(targetInfo) && heldAllowed) {
+        const updated = registry.updateConnectedTargetInfo({ tabId, targetInfo })
+        if (updated?.kind === "root") return finishCreatedTarget(updated.target)
+      }
+    }
+    return finishCreatedTarget(target)
   })
 
   const closeTargetByTargetId = Effect.fnUntraced(function* (targetId: string) {
     const target = registry.targetsByTargetId.get(targetId)
     if (!target) return
     if (target.owner === "user") return yield* detachTab(target.tabId)
-    yield* sendToExtension({ method: "tabs.remove", params: { tabId: target.tabId } })
-    detachTargetState(target.tabId)
+    // A tab that is already gone is closed: answering an error would leave Playwright's page.close() waiting forever.
+    yield* sendToExtension({ method: "tabs.remove", params: { tabId: target.tabId } }).pipe(Effect.catchIf(isMissingTabError, () => Effect.void))
+    detachTargetState(target.tabId, { reason: "target-closed" })
   })
 
   function clearTabRuntimeState(tabId: number): void {
@@ -472,7 +667,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     mainFrameIdsByTab.delete(tabId)
     protectedFrames.forgetTab(tabId)
     navigationGuard.forgetTab(tabId)
-    ghostCursor.forget(tabId)
+    deviceMetricsOverrides.forget(tabId)
     forgetTab(tabId)
     for (const [sessionId, childTabId] of suppressedChildSessions) {
       if (childTabId === tabId) suppressedChildSessions.delete(sessionId)
@@ -482,27 +677,44 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   function detachTargetState(tabId: number, detachOptions: {
     readonly preserveSessionTarget?: boolean
     readonly updateExtension?: boolean
+    readonly releasedByUser?: boolean
+    readonly reason?: string
   } = {}): void {
     rootLifecycle.invalidate(tabId)
     if (detachOptions.updateExtension !== false) {
       sendExtensionBestEffort({ method: "pageStatus.clear", params: { tabId } })
-      presentation.scheduleTabGrouping(tabId, "tabs.ungroup")
+      // An agent-opened tab stays in its group and on the idle timer after a cancel, so an ungroup here would close it.
+      if (detachOptions.releasedByUser !== true || registry.tabTargets.get(tabId)?.owner !== "relay") presentation.scheduleTabGrouping(tabId, "tabs.ungroup")
       sendExtensionBestEffort({ method: "action.setAttached", params: { tabId, attached: false } })
-      void recordingRelay.abortRecordingForTab({ tabId, reason: "Tab detached" }).catch((error: unknown) => {
+      void recordingRelay.abortRecordingForTab(tabId).catch((error: unknown) => {
         console.error("Failed to abort recording for detached tab", error)
-      })
-      void flightRecorder.cancel({ tabId }).catch((error: unknown) => {
-        console.error("Failed to stop flight recorder for detached tab", error)
       })
     }
     const detached = registry.detachRootTargetState(tabId)
     if (detached) {
       presentation.cancelTargetHandoffs(detached.target, "target-detached")
-      if (!detachOptions.preserveSessionTarget) sessions.markTargetDetached(detached.target.targetInfo.targetId)
+      if (!detachOptions.preserveSessionTarget) {
+        sessions.markTargetDetached(detached.target.targetInfo.targetId, {
+          releasedByUser: detachOptions.releasedByUser === true,
+          ...(detachOptions.reason === undefined ? {} : { reason: detachOptions.reason }),
+        })
+      }
       contextDebugLog?.(`target-detached kind=root ${targetDiagnosticIdentity(registry, detached.target)}`)
     }
     cdpClients.detachTab(tabId, { destroyed: true })
     clearTabRuntimeState(tabId)
+  }
+
+  /**
+   * Chrome answered a command for this tab that it has no such tab, though the extension never reported it closed
+   * (#153). Drop it as a reported close does, so clients see the page close, and fail what is still waiting on it.
+   */
+  function forgetMissingTab(tabId: number, method: string): void {
+    if (!registry.routingRootTarget(tabId)) return
+    relayLog("target.gone", { tabId, method })
+    detachTargetState(tabId, { reason: "target-missing" })
+    const owner = browsers.browserTab(tabId)
+    owner?.link.rpc.rejectDebuggerCommandsForTab(owner.tabId, new Error(`Target closed: tab ${tabId} no longer exists`))
   }
 
   function recordRootReplacement(change: Extract<RootTargetChange, { readonly kind: "replaced" }>): void {
@@ -557,9 +769,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     cdpRuntime,
     handoffs,
     recordingRelay,
-    flightRecorder,
     navigationGuard,
-    ghostCursor,
     tabActivity,
     protectedFrames,
     mainFrameIdsByTab,
@@ -570,11 +780,15 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     sendDebuggerCommand,
     sendExtensionBestEffort,
     applyExtensionSettings: settingsSync.applyExtensionSettings,
+    relaySettingsReady: settingsSync.relaySettingsReady,
+    hasUpdateNotice: () => updates.current !== undefined,
+    sendUpdateNotice,
     announceTab,
     browsersChanged,
     refreshPageStatus: presentation.refreshPageStatus,
     refreshTabGrouping: presentation.refreshTabGrouping,
     handleToolbarClick: presentation.handleToolbarClick,
+    handleDebuggingBarCancel: presentation.handleDebuggingBarCancel,
     cancelTargetHandoffs: presentation.cancelTargetHandoffs,
     detachTargetState,
     detachChildTargetState,
@@ -594,8 +808,8 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     cdpRuntime,
     shutdownControl,
     navigationGuard,
-    ghostCursor,
     tabActivity,
+    deviceMetricsOverrides,
     mainFrameIdsByTab,
     blankNavigationWaiters,
     sendDebuggerCommand,
@@ -612,21 +826,20 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     port,
     browserId,
     authToken,
-    relayInstance: { id: browserId, startedAt: new Date().toISOString(), pid: process.pid, managed },
+    relayInstance: { id: browserId, startedAt, pid: process.pid, managed },
     shutdown: shutdownControl,
     registry,
     recordingRelay,
-    flightRecorder,
     sessions,
     reloadExtension: () => sendToEach({ method: "runtime.reload" }),
     revokeBrowser: (key) => handshake.revokeBrowser(key),
-    cleanupTabs: (idleMinutes) =>
-      sendToEach({ method: "tabs.cleanup", ...(idleMinutes === undefined ? {} : { params: { idleMinutes } }) }),
+    cleanupTabs,
     settings: settingsSync.httpSettings,
     extensionStatus: () => handshake.extensionStatus(),
   })
 
   let relayReady = false
+  let autoUpdater: ReturnType<typeof createAutoUpdater> | undefined
 
   const { httpServer, websocketServer } = createRelayTransportServers({
     host,
@@ -635,7 +848,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     authToken,
     additionalChromeExtensionOrigins,
     isReady: () => relayReady,
-
+    onAgentHttpActivity: () => housekeeping.noteAgentActivity(),
     relayRequestHandler,
     shutdownControl,
     sessions,
@@ -649,9 +862,23 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   })
 
   const cleanup = Effect.fnUntraced(function* () {
+    relayLog("relay.shutdown.start", { managed, sessions: sessions.sessions.size, pid: process.pid })
     stopTimers()
+    autoUpdater?.stop()
     yield* shutdownControl.close().pipe(Effect.ignore)
-    yield* sessions.closeAll()
+    yield* sessions.closeAll({
+      onStalled: (sessions) => relayLog("relay.shutdown.stalled", {
+        sessions: sessions.length > 0 ? sessions.map(({ sessionId, pending }) => `${sessionId} (${pending})`).join(", ") : "none",
+        waitedMs: defaultShutdownTimeoutMs,
+      }),
+    })
+    // A relay restart keeps the extension's debugger attachments, and Patchright enables Fetch on every page it
+    // attaches to. Release every tab while the extension link is still open: the per-owner release was skipped while
+    // stopping, and this one is bounded and concurrent before rootLifecycle.close() and the link close below.
+    yield* cdpRuntime.releaseInterception(
+      registry.listRootTargets().map((target) => target.tabId),
+      () => true,
+    ).pipe(Effect.timeoutOption("5 seconds"), Effect.ignore)
     yield* rootLifecycle.close()
     if (managed) {
       yield* audit(RelayLifecycleEvent.cases.Closed.make({ instanceId: browserId })).pipe(
@@ -660,23 +887,53 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     }
     handoffs.cancelAll()
     for (const link of browsers.list()) link.rpc.rejectPending(new Error("Relay closed"))
-    yield* Effect.tryPromise(() => recordingRelay.cleanupAll("Relay closed")).pipe(Effect.ignore)
-    yield* Effect.tryPromise(() => flightRecorder.cleanupAll()).pipe(Effect.ignore)
+    yield* Effect.tryPromise(() => recordingRelay.cleanupAll()).pipe(Effect.ignore)
     for (const socket of cdpClients) socket.close()
     for (const link of browsers.list()) link.rpc.close()
     yield* closeWebSocketServer(websocketServer).pipe(logCloseError("Failed to close websocket server"))
-    yield* closeHttpServer(httpServer).pipe(logCloseError("Failed to close http server"))
+    // Removed only once this relay stops answering (until closeHttpServer completes, relay.json must keep clients on
+    // this instance instead of sending them to whatever holds the configured port, relay/port.ts) and after its last
+    // line, so uninstall and a restart that wait for the file know it is done with browse's files. ensuring covers a
+    // close that fails, where the listener may still be gone.
+    yield* closeHttpServer(httpServer).pipe(
+      logCloseError("Failed to close http server"),
+      Effect.ensuring(Effect.sync(() => {
+        relayLog("relay.shutdown.closed", { managed, pid: process.pid })
+        removeRelayState(browserId, stateRoot(), configuredPort)
+      })),
+    )
   })
 
   const close = cleanup()
 
-  yield* Effect.catch(listenHttpServer({ server: httpServer, host: listenHost, port }), (error) => {
-    return Effect.gen(function* () {
+  yield* Effect.catch(
+    Effect.gen(function* () {
+      yield* listenHttpServer({ server: httpServer, host: listenHost, port })
+      // Published only once the port is bound: clients resolve through it to find a fallback port. Never holds a token.
+      // A fallback port that can't be recorded leaves clients on 19988 (another program): fail the start instead.
+      // Inside this block, so a failed write runs cleanup instead of leaving the bound server behind.
+      yield* Effect.try({
+        try: () => writeRelayState({ port, configuredPort, pid: process.pid, instanceId: browserId, startedAt }),
+        catch: (cause) => new Error("Write the relay port file", { cause }),
+      }).pipe(Effect.catch((error) => {
+        relayLog("relay.state.write_failed", { port, configuredPort, error: error.message })
+        return port === configuredPort ? Effect.void : Effect.fail(error)
+      }))
+      // Remote browsers enter the printed address by hand; remember the last port across shutdowns (relay.json goes).
+      yield* Effect.try({
+        try: () => writeLastRelayPort(port, stateRoot(), configuredPort),
+        catch: (cause) => new Error("Write the last relay port", { cause }),
+      }).pipe(Effect.catch((error) => {
+        relayLog("relay.last_port.write_failed", { port, configuredPort, error: error.message })
+        return Effect.void
+      }))
+      yield* Effect.sync(() => pruneStaleExecuteFilesDirectories())
+    }),
+    (error) => Effect.gen(function* () {
       yield* cleanup()
       return yield* Effect.fail(error)
-    })
-  })
-  yield* Effect.sync(() => pruneStaleExecuteFilesDirectories())
+    }),
+  )
 
   yield* Effect.catch(
     Effect.gen(function* () {
@@ -706,8 +963,37 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         }))
       }
       relayReady = true
+      void updates.refresh()
       startTimers()
-      relayLog("relay.ready", { url: endpointUrl, version: opencodeBrowserVersion, build: opencodeBrowserBuildId, pid: process.pid, managed })
+      const runtime = managed ? installedRuntime() : undefined
+      if (runtime) {
+        autoUpdater = createAutoUpdater({
+          runtime,
+          isIdle: browserIdle,
+          log: relayLog,
+          onChange: () => settingsSync.sendRelaySettings(),
+        })
+        autoUpdater.start()
+      }
+      const dev = devExtension()
+      if (dev && installedDevExtension()) {
+        syncDevExtension(dev, { port }).then(
+          (result) => {
+            if (result === "updated") relayLog("extension.dev_updated", { file: dev.file })
+            for (const link of browsers.list()) if (link.local) handshake.reloadOutdatedDevExtension(link)
+          },
+          (error: unknown) => relayLog("extension.dev_update_failed", { error: (error as Error).message }),
+        )
+      }
+      relayLog("relay.ready", {
+        url: endpointUrl,
+        version: opencodeBrowserVersion,
+        build: opencodeBrowserBuildId,
+        pid: process.pid,
+        managed,
+        extensionTimeoutMs: extensionCommandTimeoutMs,
+        pingTimeoutMs: extensionPingTimeoutMs,
+      })
     }),
     (error) => Effect.gen(function* () {
       yield* cleanup()

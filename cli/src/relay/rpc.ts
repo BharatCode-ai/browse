@@ -3,6 +3,7 @@ import { WebSocket } from "ws"
 import { installCommand } from "../paths.ts"
 import {
   extensionProtocolAdvice,
+  browserReloading,
   browserUnresponsive,
   extensionProtocolCompatibility,
   type ExtensionCommand,
@@ -24,35 +25,73 @@ export type ExtensionRpcTimeouts = {
   readonly commandTimeoutMs?: number
   readonly debuggerCommandTimeoutMs?: number
   readonly livenessProbeTimeoutMs?: number
+  readonly pingTimeoutMs?: number
+  /** How long pings can go unanswered on an open socket before the relay reloads the extension. */
+  readonly wedgedAfterMs?: number
   /** An evaluate that awaits a page promise can run long, but not forever: a hung one would also hang relay shutdown. */
   readonly awaitPromiseTimeoutMs?: number
+}
+
+export type ExtensionTimeoutSetting = {
+  readonly fallback: number
+  readonly min: number
+  readonly max: number
+}
+
+/** OPENCODE_BROWSER_EXTENSION_TIMEOUT_MS: how long a command that isn't a debugger command or a ping may take. Its
+ * minimum leaves room for the extension's own 12 s tabs.create budget. */
+export const extensionCommandTimeout: ExtensionTimeoutSetting = { fallback: 30_000, min: 15_000, max: 300_000 }
+/** OPENCODE_BROWSER_PING_TIMEOUT_MS: how long a ping may go unanswered before the browser counts as asleep. */
+export const extensionPingTimeout: ExtensionTimeoutSetting = { fallback: 10_000, min: 1_000, max: 30_000 }
+
+/** A timeout from its setting's environment value: a whole number clamped to the setting's range, else its fallback. */
+export function configuredTimeoutMs(value: string | undefined, setting: ExtensionTimeoutSetting): number {
+  const trimmed = value?.trim()
+  if (!trimmed) return setting.fallback
+  const parsed = Number(trimmed)
+  return Number.isInteger(parsed) ? Math.min(Math.max(parsed, setting.min), setting.max) : setting.fallback
 }
 
 /**
  * Request/response correlator for the single extension websocket.
  *
  * A timed-out command fails only that command. Connection teardown is reserved
- * for a failed websocket-level liveness probe, so one hung debugger command
- * (for example a dialog-blocked tab) cannot destroy every attached tab's relay
- * state.
+ * for a failed websocket-level liveness probe or pings unanswered for
+ * `wedgedAfterMs`, so one hung debugger command (for example a dialog-blocked
+ * tab) cannot destroy every attached tab's relay state.
  */
 export class ExtensionRpc {
   private socket: WebSocket | undefined
   private ready = false
   unresponsive = false
   private replies = 0
+  /** When pings started going unanswered; any command reply clears it. */
+  private unansweredSince: number | undefined
   private nextRequestId = 1
   private readonly pendingRequests = new Map<number, PendingExtensionRequest>()
+  /** Pings still waiting for an answer, so a keepalive doesn't stack another on a slow worker. */
+  private readonly pendingPings = new Set<number>()
   private livenessProbe: { readonly timeout: NodeJS.Timeout; readonly socket: WebSocket; readonly onPong: () => void } | undefined
   version: string | undefined
   protocolVersion: number | null | undefined
   protocolCompatible: boolean | undefined
   protocolLegacy: boolean | undefined
+  /** Optional things the extension says it can do, such as an open-tab release on debugger detach. */
+  readonly capabilities = new Set<string>()
 
   constructor(private readonly timeouts: ExtensionRpcTimeouts = {}) {}
 
+  /** Whether the extension advertised a capability in its hello; older extensions advertise none. */
+  supports(capability: string): boolean {
+    return this.capabilities.has(capability)
+  }
+
   get connected(): boolean {
     return this.socket?.readyState === WebSocket.OPEN && this.ready && !this.unresponsive && this.protocolCompatible !== false
+  }
+
+  get pingPending(): boolean {
+    return this.pendingPings.size > 0
   }
 
   get acceptsEvents(): boolean {
@@ -69,12 +108,22 @@ export class ExtensionRpc {
     this.resetConnectionState(socket)
   }
 
-  markHandshake(version: string | undefined, reportedProtocolVersion: JsonValue | undefined): ExtensionProtocolCompatibility {
+  markHandshake(
+    version: string | undefined,
+    reportedProtocolVersion: JsonValue | undefined,
+    reportedCapabilities?: JsonValue | undefined,
+  ): ExtensionProtocolCompatibility {
     const protocol = extensionProtocolCompatibility(reportedProtocolVersion)
     this.version = version
     this.protocolVersion = protocol.version
     this.protocolCompatible = protocol.compatible
     this.protocolLegacy = protocol.legacy
+    this.capabilities.clear()
+    if (Array.isArray(reportedCapabilities)) {
+      for (const capability of reportedCapabilities) {
+        if (typeof capability === "string" && capability.length <= 64) this.capabilities.add(capability)
+      }
+    }
     return protocol
   }
 
@@ -98,10 +147,12 @@ export class ExtensionRpc {
     this.socket = socket
     this.ready = false
     this.unresponsive = false
+    this.unansweredSince = undefined
     this.version = undefined
     this.protocolVersion = undefined
     this.protocolCompatible = undefined
     this.protocolLegacy = undefined
+    this.capabilities.clear()
   }
 
   close(): void {
@@ -132,6 +183,7 @@ export class ExtensionRpc {
   handleResponse(response: ExtensionResponse): boolean {
     // Even a late reply to a timed-out heartbeat proves the worker is running again.
     this.noteResponse()
+    this.unansweredSince = undefined
     const pending = this.pendingRequests.get(response.id)
     if (!pending) {
       return false
@@ -164,10 +216,10 @@ export class ExtensionRpc {
       // usually govern it, but a hung promise must not hold the relay open forever.
       const timeoutMs = awaitsPagePromise(command)
         ? this.timeouts.awaitPromiseTimeoutMs ?? 5 * 60_000
-        : command.method === "ping" ? 4_000
+        : command.method === "ping" ? this.timeouts.pingTimeoutMs ?? extensionPingTimeout.fallback
         : command.method === "debugger.sendCommand"
         ? this.timeouts.debuggerCommandTimeoutMs ?? 60_000
-        : this.timeouts.commandTimeoutMs ?? 15_000
+        : this.timeouts.commandTimeoutMs ?? extensionCommandTimeout.fallback
       const finish = (effect: Effect.Effect<JsonObject, Error>) => {
         if (completed) {
           return
@@ -175,10 +227,16 @@ export class ExtensionRpc {
         completed = true
         clearTimeout(timeout)
         this.pendingRequests.delete(id)
+        this.pendingPings.delete(id)
         resume(effect)
       }
       const timeout = setTimeout(() => {
         if (command.method === "ping") {
+          this.unansweredSince ??= Date.now()
+          if (Date.now() - this.unansweredSince >= (this.timeouts.wedgedAfterMs ?? 60_000)) {
+            this.reloadWedged(socket)
+            return finish(Effect.fail(new Error(browserReloading)))
+          }
           // Other replies also prove liveness; a slow page command alone is never a dead browser.
           if (this.replies !== replies) return finish(Effect.succeed({}))
           this.unresponsive = true
@@ -201,6 +259,7 @@ export class ExtensionRpc {
         },
         ...(debuggerTabId === undefined ? {} : { debuggerTabId }),
       })
+      if (command.method === "ping") this.pendingPings.add(id)
       try {
         socket.send(JSON.stringify(message), (error) => {
           if (error) {
@@ -214,6 +273,7 @@ export class ExtensionRpc {
         completed = true
         clearTimeout(timeout)
         this.pendingRequests.delete(id)
+        this.pendingPings.delete(id)
       })
     })
   }
@@ -240,6 +300,18 @@ export class ExtensionRpc {
       // If ping cannot be sent the socket is already failing; let the probe
       // timeout close it.
     }
+  }
+
+  /**
+   * The browser answers websocket pings itself and the worker's own heartbeat events keep flowing, so a worker whose
+   * extension calls stopped completing keeps its socket open indefinitely. A reload gives it a fresh worker, and the
+   * close tears down this link so the reconnect starts clean.
+   */
+  private reloadWedged(socket: WebSocket): void {
+    this.unresponsive = true
+    if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) return
+    socket.send(JSON.stringify({ id: 0, method: "runtime.reload" }))
+    socket.close(4002, "Extension stopped answering commands; asked it to reload")
   }
 
   private cancelLivenessProbe(): void {

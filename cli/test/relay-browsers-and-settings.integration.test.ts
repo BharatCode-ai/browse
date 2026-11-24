@@ -38,7 +38,7 @@ afterAll(async () => {
 /**
  * A paired fake extension with one agent tab (`tabId`) attached to a CDP session; `mouse()` sends one pointer move
  * through the relay and reports what reached the extension for it: the Input events (one when human-like input is off,
- * a path when it's on) and whether the relay drew the agent cursor (it calls into an isolated world to do so).
+ * a path when it's on).
  */
 async function settingsScene(options: { readonly relayPort: number; readonly relayToken: string; readonly code: string; readonly tabId: number; readonly settings?: Record<string, unknown> }) {
   const targetInfo = { targetId: `TARGET-${options.tabId}`, type: "page", title: "Example", url: "https://example.com/", attached: true, browserContextId: "CTX" }
@@ -61,12 +61,11 @@ async function settingsScene(options: { readonly relayPort: number; readonly rel
     overrides: () => extension.commands.filter((command) => command.method === "relay.settings").map((command) => command.params?.overrides),
     async mouse() {
       const inputs = sentFor("Input.dispatchMouseEvent")
-      const worlds = sentFor("Page.createIsolatedWorld")
       x = x === 100 ? 700 : 100
       const result = await cdpCall(socket, id++, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y: 300 }, sessionId)
       expect(result.error).toBeUndefined()
       await Bun.sleep(150)
-      return { inputs: sentFor("Input.dispatchMouseEvent") - inputs, cursor: sentFor("Page.createIsolatedWorld") > worlds }
+      return { inputs: sentFor("Input.dispatchMouseEvent") - inputs }
     },
     close() {
       socket.close()
@@ -231,6 +230,23 @@ describe("several browsers", () => {
     expect((await api("/cli/session/new", { id: "on-home", browser: "home-brave" })).ok).toBe(true)
     expect((await api("/cli/session/new", { id: "on-default" })).ok).toBe(true)
 
+    // The CLI picks a browser by name, and a name that isn't connected is refused with what is.
+    const cli = (args: string[]) => spawnSync(process.execPath, [path.join(import.meta.dir, "../src/main.ts"), ...args], {
+      env: { PATH: process.env.PATH, HOME: multiHome, OPENCODE_BROWSER_HOME: multiHome, OPENCODE_BROWSER_PORT: String(multi!.port), OPENCODE_BROWSER_UPDATE_CHECK: "0" },
+      encoding: "utf8", timeout: 10_000,
+    })
+    const created = cli(["session", "new", "cli-on-home", "--browser", "Home Brave"])
+    expect(created.status).toBe(0)
+    expect(created.stdout.trim()).toBe("cli-on-home")
+    const listed = await (await api("/cli/sessions")).json() as { sessions: { id: string; browser?: string }[] }
+    expect(listed.sessions.find((session) => session.id === "cli-on-home")?.browser).toBe("home-brave")
+    const unknownCli = cli(["session", "new", "cli-on-nothing", "--browser", "nope"])
+    expect(unknownCli.status).toBe(1)
+    expect(unknownCli.stderr).toContain('No connected browser is called "nope"')
+    expect(unknownCli.stderr).toContain("home-brave")
+    const refused = await (await api("/cli/sessions")).json() as { sessions: { id: string; browser?: string }[] }
+    expect(refused.sessions.find((session) => session.id === "cli-on-nothing")).toBeUndefined()
+
     // Each session's tab opens in its browser, and commands for it go there, with that browser's own tab id.
     expect(await openTab("on-home")).toEqual({ targetId: "TARGET-HOME", value: "TARGET-HOME" })
     expect(await openTab("on-default")).toEqual({ targetId: "TARGET-WORK", value: "TARGET-WORK" })
@@ -331,48 +347,30 @@ describe("sessions of MCP servers that went away", () => {
 })
 
 describe("settings from the extension", () => {
-  test("cursor and human input follow the extension's settings at runtime; invalid values change nothing", async () => {
-    const scene = await settingsScene({ relayPort: port, relayToken: token, code: home, tabId: 81, settings: { cursor: "always", humanInput: "off" } })
+  test("human input follows the extension's settings at runtime; invalid values change nothing", async () => {
+    const scene = await settingsScene({ relayPort: port, relayToken: token, code: home, tabId: 81, settings: { humanInput: "off" } })
     expect(await until(() => scene.overrides().length === 1)).toBe(true)
     expect(scene.overrides()[0]).toEqual({})
-    expect(await scene.mouse()).toEqual({ inputs: 1, cursor: true })
-    scene.extension.emit("settings", { cursor: "sometimes", humanInput: 0 })
+    expect(await scene.mouse()).toEqual({ inputs: 1 })
+    scene.extension.emit("settings", { humanInput: 0 })
     expect(await until(() => scene.overrides().length === 2)).toBe(true)
-    expect(await scene.mouse()).toEqual({ inputs: 1, cursor: true })
-    scene.extension.emit("settings", { cursor: "off", humanInput: "on" })
+    expect(await scene.mouse()).toEqual({ inputs: 1 })
+    scene.extension.emit("settings", { humanInput: "on" })
     expect(await until(() => scene.overrides().length === 3)).toBe(true)
     await Bun.sleep(200)
     const paced = await scene.mouse()
     expect(paced.inputs).toBeGreaterThan(1)
-    expect(paced.cursor).toBe(false)
     scene.close()
   }, 20_000)
 
-  test("with the cursor always shown, a recording without cursor: true still leaves it out", async () => {
-    const scene = await settingsScene({ relayPort: port, relayToken: token, code: home, tabId: 84, settings: { cursor: "always", humanInput: "off" } })
-    expect(await until(() => scene.overrides().length === 1)).toBe(true)
-    expect((await scene.mouse()).cursor).toBe(true)
-    const post = (pathname: string, body: unknown) =>
-      fetch(`${base}${pathname}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) })
-    expect((await post("/flight-recorder/start", { tabId: 84 })).ok).toBe(true)
-    expect((await scene.mouse()).cursor).toBe(false)
-    await post("/flight-recorder/cancel", { tabId: 84 })
-    expect((await scene.mouse()).cursor).toBe(true)
-    expect((await post("/flight-recorder/start", { tabId: 84, cursor: true })).ok).toBe(true)
-    expect((await scene.mouse()).cursor).toBe(true)
-    await post("/flight-recorder/cancel", { tabId: 84 })
-    scene.close()
-  }, 20_000)
-
-  test("an older extension that sends no settings gets the defaults (human input on, no cursor), not the last extension's", async () => {
-    const first = await settingsScene({ relayPort: port, relayToken: token, code: home, tabId: 82, settings: { cursor: "always", humanInput: "off" } })
+  test("an older extension that sends no settings gets the defaults (human input on), not the last extension's", async () => {
+    const first = await settingsScene({ relayPort: port, relayToken: token, code: home, tabId: 82, settings: { humanInput: "off" } })
     expect(await until(() => first.overrides().length === 1)).toBe(true)
     first.close()
     await Bun.sleep(200)
     const older = await settingsScene({ relayPort: port, relayToken: token, code: home, tabId: 83 })
     const moved = await older.mouse()
     expect(moved.inputs).toBeGreaterThan(1)
-    expect(moved.cursor).toBe(false)
     // It never hears of settings it doesn't know.
     expect(older.overrides()).toEqual([])
     older.close()
@@ -380,12 +378,12 @@ describe("settings from the extension", () => {
 
   test("environment variables override the settings, and the relay reports them", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "browse-relay-env-"))
-    const started = await startRelay(root, { OPENCODE_BROWSER_GHOST_CURSOR: "1", OPENCODE_BROWSER_HUMAN_INPUT: "0", OPENCODE_BROWSER_AGENT_WINDOW: "separate" })
+    const started = await startRelay(root, { OPENCODE_BROWSER_HUMAN_INPUT: "0", OPENCODE_BROWSER_AGENT_WINDOW: "separate" })
     try {
-      const scene = await settingsScene({ relayPort: started.port, relayToken: started.token, code: root, tabId: 91, settings: { cursor: "off", humanInput: "on" } })
+      const scene = await settingsScene({ relayPort: started.port, relayToken: started.token, code: root, tabId: 91, settings: { humanInput: "on" } })
       expect(await until(() => scene.overrides().length === 1)).toBe(true)
-      expect(scene.overrides()[0]).toEqual({ agentWindow: "separate", cursor: "always", humanInput: "off" })
-      expect(await scene.mouse()).toEqual({ inputs: 1, cursor: true })
+      expect(scene.overrides()[0]).toEqual({ agentWindow: "separate", humanInput: "off" })
+      expect(await scene.mouse()).toEqual({ inputs: 1 })
       expect(scene.extension.commands.find((command) => command.method === "tabs.create")?.params?.window).toBe("separate")
       scene.close()
     } finally {
@@ -397,7 +395,7 @@ describe("settings from the extension", () => {
 
 /** A fake extension holding settings the way the real one does (settings.get / settings.set over its storage). */
 function settingsExtension(code: string, relayPort = port) {
-  const stored: Record<string, unknown> = { window: "current", grouping: "session", idleMinutes: 10, cursor: "off", humanInput: "on", handoffNotifications: "recording" }
+  const stored: Record<string, unknown> = { window: "current", grouping: "session", groupCollapse: "auto", idleMinutes: 10, muteTabs: "off", humanInput: "on", handoffNotifications: "recording" }
   const extension = new FakeExtension(code, relayPort)
     .on("settings.get", () => ({ settings: { ...stored } }))
     .on("settings.set", (command) => {
@@ -423,27 +421,40 @@ describe("the settings tool's relay API", () => {
     const got = await settingsRequest(base, token)
     expect(got.status).toBe(200)
     expect(got.body.settings.grouping).toMatchObject({ value: "session", effective: "session", allowed: ["shared", "session", "none"] })
-    expect(got.body.settings.cursor.overriddenBy).toBeUndefined()
+    expect(got.body.settings.groupCollapse).toMatchObject({ value: "auto", effective: "auto", allowed: ["auto", "off"] })
+    expect(got.body.settings.muteTabs).toMatchObject({ value: "off", effective: "off", allowed: ["on", "off"] })
     expect(got.body.note).toContain("OPENCODE_BROWSER_ALLOW_NODE")
 
-    const set = await settingsRequest(base, token, { grouping: "shared", cursor: "always", idleMinutes: "never", humanInput: "on" })
+    const set = await settingsRequest(base, token, { grouping: "shared", idleMinutes: "never", humanInput: "on" })
     expect(set.status).toBe(200)
-    expect(sets()).toEqual([{ grouping: "shared", cursor: "always", idleMinutes: 0, humanInput: "on" }])
-    expect(stored).toMatchObject({ grouping: "shared", cursor: "always", idleMinutes: 0 })
+    expect(sets()).toEqual([{ grouping: "shared", idleMinutes: 0, humanInput: "on" }])
+    expect(stored).toMatchObject({ grouping: "shared", idleMinutes: 0 })
     expect(set.body.changed).toEqual([
       { key: "grouping", from: "session", to: "shared" },
-      { key: "cursor", from: "off", to: "always" },
       { key: "idleMinutes", from: 10, to: "never" },
     ])
     expect(set.body.unchanged).toEqual(["humanInput"])
     expect(set.body.message).toContain("Tell the user what you changed")
     expect((await settingsRequest(base, token)).body.settings.idleMinutes.value).toBe("never")
 
+    const collapse = await settingsRequest(base, token, { groupCollapse: "off" })
+    expect(collapse.status).toBe(200)
+    expect(collapse.body.changed).toEqual([{ key: "groupCollapse", from: "auto", to: "off" }])
+    expect(sets()).toEqual([{ grouping: "shared", idleMinutes: 0, humanInput: "on" }, { groupCollapse: "off" }])
+    expect(stored.groupCollapse).toBe("off")
+
+    const mute = await settingsRequest(base, token, { muteTabs: "on" })
+    expect(mute.status).toBe(200)
+    expect(mute.body.changed).toEqual([{ key: "muteTabs", from: "off", to: "on" }])
+    expect(sets()).toEqual([{ grouping: "shared", idleMinutes: 0, humanInput: "on" }, { groupCollapse: "off" }, { muteTabs: "on" }])
+    expect(stored.muteTabs).toBe("on")
+
     // Invalid values, unknown keys and security switches are refused before anything reaches the extension.
     for (const [request, expected] of [
       [{ grouping: "Shared" }, "grouping must be one of shared, session, none"],
+      [{ groupCollapse: "sometimes" }, "groupCollapse must be one of auto, off"],
+      [{ muteTabs: "quiet" }, "muteTabs must be one of on, off"],
       [{ idleMinutes: 45 }, "idleMinutes must be one of 10, 30, 60, never"],
-      [{ cursor: true }, "cursor must be one of off, always"],
       [{ colour: "blue" }, "Unknown setting \"colour\""],
       [{ OPENCODE_BROWSER_ALLOW_NODE: "1" }, "security switches"],
       [{ grouping: "none", allowAllCookies: true }, "security switches"],
@@ -453,8 +464,20 @@ describe("the settings tool's relay API", () => {
       expect(refused.status).toBe(400)
       expect(String(refused.body.error)).toContain(expected)
     }
-    expect(sets()).toHaveLength(1)
+    expect(sets()).toHaveLength(3)
     extension.close()
+    await Bun.sleep(200)
+  }, 20_000)
+
+  test("an extension that predates groupCollapse and muteTabs reads their defaults", async () => {
+    const older = new FakeExtension(home, port)
+      .on("settings.get", () => ({ settings: { window: "current", grouping: "shared", idleMinutes: 10, humanInput: "on", handoffNotifications: "recording" } }))
+    expect(await older.pair()).toBe(true)
+    const got = await settingsRequest(base, token)
+    expect(got.status).toBe(200)
+    expect(got.body.settings.groupCollapse).toMatchObject({ value: "auto", effective: "auto", allowed: ["auto", "off"] })
+    expect(got.body.settings.muteTabs).toMatchObject({ value: "off", effective: "off", allowed: ["on", "off"] })
+    older.close()
     await Bun.sleep(200)
   }, 20_000)
 
@@ -469,24 +492,33 @@ describe("the settings tool's relay API", () => {
     expect(String(tooOld.body.error)).toContain("too old to read or change settings")
     older.close()
     await Bun.sleep(200)
+
+    // An older extension's strict settings validator refuses the key it doesn't know.
+    const unknown = new FakeExtension(home, port)
+      .on("settings.get", () => ({ settings: { window: "current", grouping: "shared", idleMinutes: 10, humanInput: "on", handoffNotifications: "recording" } }))
+      .on("settings.set", () => { throw new Error("Unknown setting: groupCollapse") })
+    expect(await unknown.pair()).toBe(true)
+    const refused = await settingsRequest(base, token, { groupCollapse: "off" })
+    expect(String(refused.body.error)).toContain("too old to read or change settings")
+    unknown.close()
+    await Bun.sleep(200)
   }, 20_000)
 
   test("a setting an environment variable fixes is reported, and not written", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "browse-relay-settings-env-"))
-    const started = await startRelay(root, { OPENCODE_BROWSER_GHOST_CURSOR: "0", OPENCODE_BROWSER_AGENT_WINDOW: "separate" })
+    const started = await startRelay(root, { OPENCODE_BROWSER_AGENT_WINDOW: "separate" })
     try {
       const { extension, sets } = settingsExtension(root, started.port)
       expect(await extension.pair()).toBe(true)
       const relayBase = `http://127.0.0.1:${started.port}`
       const got = await settingsRequest(relayBase, started.token)
-      expect(got.body.settings.cursor).toMatchObject({ value: "off", effective: "off", overriddenBy: "OPENCODE_BROWSER_GHOST_CURSOR" })
       expect(got.body.settings.window).toMatchObject({ value: "current", effective: "separate", overriddenBy: "OPENCODE_BROWSER_AGENT_WINDOW" })
       expect(got.body.settings.humanInput.overriddenBy).toBeUndefined()
-      const set = await settingsRequest(relayBase, started.token, { cursor: "always", grouping: "none" })
+      const set = await settingsRequest(relayBase, started.token, { window: "current", grouping: "none" })
       expect(set.status).toBe(200)
       expect(sets()).toEqual([{ grouping: "none" }])
-      expect(set.body.overridden).toEqual([{ key: "cursor", requested: "always", variable: "OPENCODE_BROWSER_GHOST_CURSOR", effective: "off" }])
-      expect(set.body.message).toContain("Not changed: cursor is fixed to off by OPENCODE_BROWSER_GHOST_CURSOR")
+      expect(set.body.overridden).toEqual([{ key: "window", requested: "current", variable: "OPENCODE_BROWSER_AGENT_WINDOW", effective: "separate" }])
+      expect(set.body.message).toContain("Not changed: window is fixed to separate by OPENCODE_BROWSER_AGENT_WINDOW")
       expect(set.body.message).toContain("relay restart")
       extension.close()
     } finally {

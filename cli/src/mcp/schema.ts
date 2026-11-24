@@ -4,7 +4,6 @@ import type { JsonObject } from "../protocol.ts"
 import * as RelayClient from "../relay/client.ts"
 import { getObject, getString, parseTargetSelection } from "../relay/helpers.ts"
 import {
-  AuthProfileSummary,
   ExecuteAftermath,
   ExecuteLogEntry,
   ExecuteLogSummary,
@@ -17,9 +16,16 @@ import {
   type ExecuteResponse,
   type TargetSelection,
 } from "../relay/schema.ts"
-import { settingKeys, type SettingKey } from "../relay/user-settings.ts"
+import { settingKeys, type SettingKey, type SettingValue } from "../relay/user-settings.ts"
+import type { UpdateNotice } from "../update.ts"
 
 export type CurrentSession = { id: string; established: boolean }
+
+/**
+ * An agent calling the tools: its current session, every session it has made current, whether it shares them with
+ * every other unnamed caller, and whether it saw the update note.
+ */
+export type Caller = CurrentSession & { readonly sessions: Set<string>; readonly shared: boolean; updateNoted: boolean }
 
 export type ExecuteArguments = {
   readonly code: string
@@ -36,6 +42,9 @@ export type AdoptArguments = {
 }
 
 /** The one-time note on a tool result: what to tell the user, and that the agent may run the update itself. */
+export function mcpUpdateNote(notice: Pick<UpdateNotice, "summary" | "command">): string {
+  return `Note: browse has an update: ${notice.summary}. Tell the user they can run \`${notice.command}\` and then restart opencode, or ask you to run it for them.`
+}
 
 export function objectSchema(properties: JsonObject, required: readonly string[] = []): JsonObject {
   return {
@@ -46,15 +55,27 @@ export function objectSchema(properties: JsonObject, required: readonly string[]
   }
 }
 
+/**
+ * A property accepting exactly `values`, as one single-typed `enum` per JSON type. Settings are the one place a tool
+ * schema mixes numbers and strings (`idleMinutes` is 10, 30, 60 or "never"), and some MCP clients reject an `enum`
+ * whose values have different types, which fails their whole tool list.
+ */
+export function valuesSchema(values: readonly SettingValue[], description: string): JsonObject {
+  const groups = new Map<string, SettingValue[]>()
+  for (const value of values) {
+    const type = typeof value === "number" ? (Number.isInteger(value) ? "integer" : "number") : "string"
+    groups.set(type, [...(groups.get(type) ?? []), value])
+  }
+  const variants = [...groups].map(([type, items]) => ({ type, enum: items }))
+  return variants.length === 1 ? { ...variants[0]!, description } : { anyOf: variants, description }
+}
+
 export const emptyInputSchema = objectSchema({})
 export const sessionSchemaProperty = {
   type: "string",
-  description: "Optional session id. Defaults to this MCP server's current session.",
+  description: "Optional session id. Defaults to your current session.",
 } as const
 export const sessionAliasSchemaProperty = { type: "string", description: "Same as id." } as const
-export const sessionOnlyInputSchema = objectSchema({
-  session: sessionSchemaProperty,
-})
 
 /**
  * The execute tool's structured result. The agent's return value appears once (as `value`), and only context that has
@@ -74,6 +95,7 @@ export const ExecuteToolOutput = Schema.Struct({
 export const StatusToolOutput = Schema.Struct({
   endpoint: Schema.String,
   currentSession: Schema.String,
+  sharedSession: Schema.Boolean,
   version: RelayVersion,
   status: ExtensionStatus,
   buildProblem: Schema.optionalKey(Schema.String),
@@ -105,24 +127,38 @@ export const NetworkToolOutput = Schema.Struct({
   truncatedBodyCount: Schema.optionalKey(Schema.Number),
   droppedEntryCount: Schema.optionalKey(Schema.Number),
   urlFilter: Schema.optionalKey(Schema.String),
-  resourceTypes: Schema.optionalKey(Schema.Array(Schema.String)),
-  content: Schema.optionalKey(Schema.Literals(["omit", "embed"])),
-  secrets: Schema.optionalKey(Schema.String),
   endsAt: Schema.optionalKey(Schema.String),
   ended: Schema.optionalKey(Schema.String),
   stoppedAt: Schema.optionalKey(Schema.String),
-  outputPath: Schema.optionalKey(Schema.String),
-  authProfile: Schema.optionalKey(AuthProfileSummary),
-  updatedSecretRefs: Schema.optionalKey(Schema.Array(Schema.String)),
-  observedSecretRefs: Schema.optionalKey(Schema.Array(Schema.String)),
-  endpoints: Schema.optionalKey(Schema.Array(Schema.Struct({
-    method: Schema.String,
-    url: Schema.String,
-    status: Schema.optionalKey(Schema.Number),
-    count: Schema.Number,
-    requestHeaders: Schema.optionalKey(Schema.Array(Schema.String)),
-    requestKeys: Schema.optionalKey(Schema.Array(Schema.String)),
-    responseKeys: Schema.optionalKey(Schema.Array(Schema.String)),
+  exchanges: Schema.optionalKey(Schema.Array(Schema.Struct({
+    id: Schema.String,
+    startedDateTime: Schema.String,
+    durationMs: Schema.Number,
+    request: Schema.Struct({
+      method: Schema.String,
+      url: Schema.String,
+      headers: Schema.Array(Schema.Struct({ name: Schema.String, value: Schema.String })),
+      resourceType: Schema.String,
+      body: Schema.optionalKey(Schema.Struct({
+        size: Schema.Number,
+        mimeType: Schema.String,
+        text: Schema.optionalKey(Schema.String),
+        truncated: Schema.Boolean,
+      })),
+      redirectedFrom: Schema.optionalKey(Schema.String),
+    }),
+    response: Schema.optionalKey(Schema.Struct({
+      status: Schema.Number,
+      statusText: Schema.String,
+      headers: Schema.Array(Schema.Struct({ name: Schema.String, value: Schema.String })),
+      body: Schema.optionalKey(Schema.Struct({
+        size: Schema.Number,
+        mimeType: Schema.String,
+        text: Schema.optionalKey(Schema.String),
+        truncated: Schema.Boolean,
+      })),
+    })),
+    failure: Schema.optionalKey(Schema.String),
   }))),
   cancelled: Schema.optionalKey(Schema.Boolean),
 })
@@ -136,7 +172,6 @@ export const RecordingToolOutput = Schema.Struct({
   startedAt: Schema.optionalKey(Schema.Number),
   path: Schema.optionalKey(Schema.String),
   mimeType: Schema.optionalKey(Schema.String),
-  mode: Schema.optionalKey(Schema.Literals(["tab-capture", "cdp"])),
   artifactType: Schema.optionalKey(Schema.Literals(["webm", "mp4"])),
   frameRate: Schema.optionalKey(Schema.Number),
   duration: Schema.optionalKey(Schema.Number),
@@ -145,28 +180,6 @@ export const RecordingToolOutput = Schema.Struct({
   quality: Schema.optionalKey(RecordingQuality),
   isRecording: Schema.optionalKey(Schema.Boolean),
   error: Schema.optionalKey(Schema.String),
-})
-
-/** The result of any `flight_recorder` action, with action-specific fields optional. */
-export const FlightRecorderToolOutput = Schema.Struct({
-  action: Schema.Literals(["start", "status", "save_last", "cancel"]),
-  session: Schema.String,
-  active: Schema.optionalKey(Schema.Boolean),
-  tabId: Schema.optionalKey(Schema.Number),
-  sessionId: Schema.optionalKey(Schema.String),
-  startedAt: Schema.optionalKey(Schema.Number),
-  retentionMs: Schema.optionalKey(Schema.Number),
-  retainedDurationMs: Schema.optionalKey(Schema.Number),
-  frameRate: Schema.optionalKey(Schema.Number),
-  bufferedFrames: Schema.optionalKey(Schema.Number),
-  bufferedBytes: Schema.optionalKey(Schema.Number),
-  sourceFrameCount: Schema.optionalKey(Schema.Number),
-  droppedFrameCount: Schema.optionalKey(Schema.Number),
-  saving: Schema.optionalKey(Schema.Boolean),
-  path: Schema.optionalKey(Schema.String),
-  durationMs: Schema.optionalKey(Schema.Number),
-  frameCount: Schema.optionalKey(Schema.Number),
-  cancelled: Schema.optionalKey(Schema.Boolean),
 })
 
 /** Settings the MCP tool may read and change. Update behaviour is the user's to set, never an agent's. */
@@ -192,16 +205,6 @@ export const SettingsToolOutput = Schema.Struct({
   unchanged: Schema.optionalKey(SettingsSetResponse.fields.unchanged),
   overridden: Schema.optionalKey(SettingsSetResponse.fields.overridden),
   message: Schema.optionalKey(SettingsSetResponse.fields.message),
-})
-
-export const SecretsListToolOutput = Schema.Struct({
-  secrets: Schema.Array(Schema.Struct({
-    name: Schema.String,
-    kind: Schema.Literals(["password", "totp"]),
-    allowedOrigins: Schema.Array(Schema.String),
-    createdAt: Schema.String,
-    updatedAt: Schema.String,
-  })),
 })
 
 /** The JSON Schema a tool advertises from its Effect Schema (the same conversion Effect's McpServer uses). */
@@ -243,13 +246,67 @@ export function executeToolOutput(result: ExecuteResponse & { readonly notice?: 
   }
 }
 
+// Many clients show only the text of an error result, and one cuts error text past 10,000 characters from the middle,
+// so an error's text carries its warnings and context and stays under that.
+const errorMessageLimit = 3000
+const errorLogLimit = 20
+const errorLogLineLimit = 300
+const errorLogsLimit = 2500
+
+function clip(text: string, limit: number): string {
+  if (text.length <= limit) return text
+  const head = Math.ceil(limit * 2 / 3)
+  const tail = limit - head
+  return `${text.slice(0, head)}\n… ${text.length - limit} characters cut …\n${text.slice(-tail)}`
+}
+
+function aftermathLine(aftermath: ExecuteAftermath | undefined): string | undefined {
+  if (!aftermath) return undefined
+  const parts: string[] = []
+  if (aftermath.endUrl === null) parts.push("the page closed")
+  else if (aftermath.startUrl !== aftermath.endUrl) parts.push(`moved from ${clip(aftermath.startUrl ?? "nowhere", 200)} to ${clip(aftermath.endUrl, 200)}`)
+  if (aftermath.navigations.length > 0) parts.push(`${aftermath.navigations.length} navigation${aftermath.navigations.length === 1 ? "" : "s"}`)
+  if (aftermath.consoleErrorCount > 0) parts.push(`${aftermath.consoleErrorCount} console error${aftermath.consoleErrorCount === 1 ? "" : "s"}`)
+  if (aftermath.pageErrorCount > 0) parts.push(`${aftermath.pageErrorCount} page error${aftermath.pageErrorCount === 1 ? "" : "s"}`)
+  if (aftermath.handoffs > 0) parts.push(`${aftermath.handoffs} handoff${aftermath.handoffs === 1 ? "" : "s"}`)
+  return parts.length > 0 ? `Page: ${parts.join("; ")}` : undefined
+}
+
+function errorLogsBlock(logs: readonly ExecuteLogEntry[]): string | undefined {
+  if (logs.length === 0) return undefined
+  const lines: string[] = []
+  let size = 0
+  for (const entry of logs.slice(-errorLogLimit).reverse()) {
+    const prefix = entry.source === "page" ? `[page ${entry.type}]` : `[${entry.type}]`
+    const repeat = entry.repeatCount && entry.repeatCount > 1 ? ` (×${entry.repeatCount})` : ""
+    const line = clip(`${prefix} ${entry.text}${repeat}`, errorLogLineLimit).replaceAll("\n", " ")
+    if (size + line.length > errorLogsLimit) break
+    lines.unshift(line)
+    size += line.length + 1
+  }
+  const shown = lines.length < logs.length ? `last ${lines.length} of ${logs.length}` : `${logs.length}`
+  return `Logs (${shown}):\n${lines.join("\n")}`
+}
+
+/** The text of a failed execute: the error first, then the warnings, diagnostic, page movement and recent logs. */
+export function executeErrorText(result: ExecuteResponse): string {
+  const warnings = result.warnings ?? []
+  return [
+    clip(result.text, errorMessageLimit),
+    warnings.length > 0 ? `Warnings:\n${warnings.map((warning) => `- ${warning}`).join("\n")}` : undefined,
+    result.diagnostic ? `Diagnostic: ${result.diagnostic}` : undefined,
+    aftermathLine(result.aftermath),
+    errorLogsBlock(result.logs),
+  ].filter((part): part is string => part !== undefined).join("\n\n")
+}
+
 /**
  * The text fallback for an execute. A string return is the agent's own readable text, not JSON; a structured return is
  * its compact JSON value. That keeps one copy of the value outside the structured result.
  */
 export function executeToolText(result: ExecuteResponse & { readonly notice?: string }): string {
   const text = result.isError
-    ? result.text
+    ? executeErrorText(result)
     : Predicate.isString(result.value)
       ? result.value
       : result.value === undefined
@@ -258,13 +315,16 @@ export function executeToolText(result: ExecuteResponse & { readonly notice?: st
   return result.notice ? `${text}\n\n${result.notice}` : text
 }
 
-/** The MCP result for one execute: images keep their content blocks and text, everything else gets structured output. */
+/**
+ * The MCP result for one execute: images keep their content blocks and text, errors are text only, and everything else
+ * also gets structured output.
+ */
 export function executeToolResult(value: unknown): McpSchema.CallToolResult {
   const result = value as ExecuteResponse & { readonly notice?: string }
   if (result.media && result.media.length > 0) {
     return new McpSchema.CallToolResult({
       content: [
-        McpSchema.TextContent.make({ text: result.text }),
+        McpSchema.TextContent.make({ text: result.isError ? executeErrorText(result) : result.text }),
         ...result.media.map((image) => McpSchema.ImageContent.make({
           data: new Uint8Array(Buffer.from(image.data, "base64")),
           mimeType: image.mimeType,
@@ -273,6 +333,9 @@ export function executeToolResult(value: unknown): McpSchema.CallToolResult {
       isError: result.isError,
     })
   }
+  // A failed execute is text only: a client that prefers structuredContent would otherwise show the context without
+  // the error.
+  if (result.isError) return toolResult({ text: executeToolText(result), isError: true })
   return toolResultForValue(executeToolOutput(result), {
     outputSchema: ExecuteToolOutput,
     text: executeToolText(result),

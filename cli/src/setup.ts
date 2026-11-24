@@ -27,8 +27,9 @@ import {
   type AgentReceipt,
 } from "./setup/agent-config.ts"
 import { agentFlags, agentPlan, pickAgents } from "./setup/agent-picker.ts"
-import { describeAutoUpdate } from "./update/local-runtime.ts"
+import { autoUpdateStatus, describeAutoUpdate } from "./update/auto-update.ts"
 import { mintPairingCode, pairingCodeKey, pendingPairingCodeKeys } from "./relay/browser-pairing.ts"
+import { resolveRelayPort } from "./relay/port.ts"
 import { cliCommand, compiledBinary, entryCommand, installCommand, oldStoreMarker, scriptEntry } from "./paths.ts"
 import {
   extensionProtocolAdvice,
@@ -49,6 +50,7 @@ import {
 } from "./setup/browsers.ts"
 import {
   ensureRelay,
+  ensureRelayQuietly,
   extension,
   extensionStatus,
   pair,
@@ -56,6 +58,7 @@ import {
   reloadOutdatedExtension,
   set,
   settledExtensionStatus,
+  syncDev,
   uninstall,
   type ExtensionStatus,
 } from "./setup/commands.ts"
@@ -197,7 +200,7 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
 
   mkdirSync(path.dirname(files.settings), { recursive: true, mode: 0o700 })
   mkdirSync(files.dir, { recursive: true, mode: 0o700 })
-  const { entry, version } = await installRuntime()
+  const { entry, version, spawnEntry } = await installRuntime()
   log(`✓ browse ${version} installed${fromSource ? " (from source)" : ""}`)
   const onPath = args.includes("--no-modify-path") ? undefined : path.isAbsolute(entry) && !scriptEntry(entry) ? addToPath(path.dirname(entry)) : undefined
   if (onPath) log(`✓ Added browse to your PATH (${tilde(onPath)}). Open a new terminal to use it.`)
@@ -296,15 +299,16 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
       )
     }
   }
-  for (const line of restartOutdatedRelay(entry) ?? []) log(line)
+  for (const line of restartOutdatedRelay(spawnEntry) ?? []) log(line)
   const legacy = selected.includes("opencode") ? legacyBrowserControl() : []
   if (legacy.length)
     log(
       `! Also configured: ${legacy.map((name) => `"${name}"`).join(", ")}, ${legacy.length === 1 ? "an older browser MCP server" : "older browser MCP servers"} that browse replaces. Remove ${legacy.length === 1 ? "it" : "them"} from ${configFile()} to avoid two sets of browser tools.`,
     )
-  if (args.includes("--remote")) return installRemote(entry, tty)
+  if (args.includes("--remote")) return installRemote(spawnEntry, tty)
 
-  const initial = await settledExtensionStatus(entry)
+  await syncDev()
+  const initial = await settledExtensionStatus(spawnEntry)
   const connected = initial?.connected ? initial : undefined
   const pairedOffline = initial?.pairingState === "paired-offline"
   // The relay saw this browser try to connect without a token (or refuse one): it's installed, not missing.
@@ -312,7 +316,9 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
   const folder = unpackedFolder()
   if (folder && !pairedOffline) {
     // The unpacked extension finds a one-time code in its own folder and exchanges it for its key, without a step.
-    pairUnpacked()
+    // This runs before any early return (extension off, mismatch, old store build): no relay is started here, so the
+    // code names the live port only when a relay already runs.
+    await pairUnpacked()
     // A browser already running an older unpacked build keeps its old code until it reloads; ask it to, silently:
     // install never talks about unpacked builds.
     const reload = connected ? await reloadOutdatedExtension(connected, folder) : "current"
@@ -340,7 +346,7 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
     const matches = scanned.flatMap((d) => d.enabled).filter((m) => STORE_IDS.includes(m.id))
     if (!matches.length || !matches.every(oldStoreBuild)) return true
     writeFileSync(oldStoreMarker(), "2\n")
-    ensureRelay(entry)
+    ensureRelay(spawnEntry)
     log(
       `! Found browse ${matches[0]!.version} in ${matches[0]!.browser.name}. ${extensionProtocolAdvice(2, { install: cliCommand("install") }, "store")}`,
     )
@@ -364,7 +370,13 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
     env,
   })
   if (connected || found === "off" || pairedOffline) return
-  ensureRelay(entry)
+  // Up only now, before a pairing file or link names the relay's listen port when it isn't 19988 (a fallback). A
+  // port-less file code only works on 19988, so if the relay can't start the extension starts there and scans.
+  if (folder) {
+    const failure = ensureRelayQuietly(spawnEntry)
+    if (failure) fail(failure)
+    await pairUnpacked()
+  } else ensureRelay(spawnEntry)
   let code: string | undefined
   const pairingCode = () =>
     code && pendingPairingCodeKeys().includes(pairingCodeKey(code)) ? code : (code = mintPairingCode())
@@ -375,6 +387,7 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
       allowOpen: !args.includes("--no-open"),
       env,
       code: pairingCode,
+      port: resolveRelayPort(),
     })
   if (needsPairing) log("browse is installed in a browser but isn't paired with this relay yet.")
   type PairingOffer = "opened" | "manual" | "code" | "none"
@@ -382,14 +395,14 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
   const blocked = detections.filter((d) => d.blocked).map((d) => d.browser.name)
   if (offer === "none" && blocked.length) {
     log(
-      `Couldn't check ${blocked.join(", ")}. If browse is already installed there, pair it manually. ${manualPair(pairingCode())}`,
+      `Couldn't check ${blocked.join(", ")}. If browse is already installed there, pair it manually. ${manualPair(pairingCode(), resolveRelayPort())}`,
     )
     offer = "manual"
   }
   // Nothing to open (SSH, no display, no detected profile): the code is still the way in, and the page that says
   // "run install again" has a field for it.
   if (needsPairing && offer === "none") {
-    log(manualPair(pairingCode()))
+    log(manualPair(pairingCode(), resolveRelayPort()))
     offer = "code"
   }
   const next = needsPairing
@@ -439,7 +452,7 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(1000, deadline - Date.now()))))
     } while (!stopped && Date.now() < deadline)
     if (!env.tty) return log(`! Not connected yet. ${agentNext()}`)
-    log(`! Not connected yet. ${code ? manualPair(pairingCode()) : next}`)
+    log(`! Not connected yet. ${code ? manualPair(pairingCode(), resolveRelayPort()) : next}`)
     process.exitCode = 1
   } finally {
     process.off("SIGINT", stop)
@@ -458,7 +471,7 @@ export function printSetupStatus() {
   log(`Version:   ${runtime ? `${runtime.version ?? "unknown"} (${runtime.entry})` : "not installed"}`)
   log(`opencode:  ${settings?.opencode ?? findOpencode([]) ?? "not found"}`)
   log(mcpServers()[MCP_NAME] ? `MCP:       "${MCP_NAME}" configured` : "MCP:       not configured")
-  log(describeAutoUpdate())
+  log(describeAutoUpdate(autoUpdateStatus()))
   log(`Files:     ${paths.config}, ${paths.data}, ${paths.state}, ${paths.cache}`)
   log(`Logs:      ${path.join(paths.state, "logs")}`)
   log("")
@@ -467,7 +480,7 @@ export function printSetupStatus() {
 export async function runSetup(command: string, args: string[]) {
   if (command === "install") return install(args)
   if (command === "extension") return extension()
-  if (command === "uninstall") return uninstall(args)
+  if (command === "uninstall") return uninstall()
   if (command === "pair") return pair(args)
   if (command === "set") return set(args)
 }

@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import type { BrowserContext, Frame, Page } from "patchright-core"
 import {
+  debuggingBarDismissedWarning,
   defaultPageClosedWarning,
   defaultPageRecoveredWarning,
   defaultPageReattachedWarning,
   defaultPageReplacedWarning,
+  installClosedPageReplacementGuard,
   SessionPageRecoveryError,
 } from "../src/execute/page-recovery.ts"
 import { DefaultPageHost, type DefaultPageHostOptions, type DefaultPageTarget } from "../src/execute/default-page.ts"
@@ -19,6 +21,7 @@ class FakePage {
   targetId: string
   closed = false
   defaultTimeoutMs: number | undefined
+  targetProbes = 0
   evaluateCalls = 0
   evaluateError: unknown
   readonly emulatedMedia: Array<{ readonly features: readonly unknown[]; readonly media?: string }> = []
@@ -77,6 +80,10 @@ class FakePage {
     return false
   }
 
+  async goto(): Promise<null> {
+    return null
+  }
+
   async close(): Promise<void> {
     this.closed = true
     this.emit("close")
@@ -88,6 +95,7 @@ class FakePage {
       async newCDPSession() {
         return {
           async send(method: string, parameters: { features?: readonly unknown[]; media?: string }) {
+            if (method === "Target.getTargetInfo") page.targetProbes += 1
             if (method === "Emulation.setEmulatedMedia") {
               page.emulatedMedia.push({
                 features: parameters.features ?? [],
@@ -194,8 +202,27 @@ class TestHost extends DefaultPageHost {
     return this.pendingWarnings
   }
 
+  /** Takes the queued warnings, as an execute result does when it finishes. */
+  drainWarnings(): string[] {
+    const warnings = this.pendingWarnings
+    this.pendingWarnings = []
+    return warnings
+  }
+
   mediaFeatures(): Map<string, string> {
     return this.explicitMediaFeatures
+  }
+
+  raiseActionTimeout(milliseconds: number): void {
+    this.actionTimeoutMs = milliseconds
+  }
+
+  armActionTimeout(page: Page): void {
+    this.applyActionTimeout(page)
+  }
+
+  restoreActionTimeoutNow(): void {
+    this.restoreActionTimeout()
   }
 }
 
@@ -302,6 +329,80 @@ describe("DefaultPageHost binding", () => {
     expect(page.emulatedMedia.at(-1)?.features).toContainEqual({ name: "prefers-color-scheme", value: "dark" })
   })
 
+  test("a raised action timeout is applied on bind, survives navigation, and is restored", async () => {
+    const host = new TestHost()
+    const page = new FakePage()
+    host.raiseActionTimeout(240_000)
+
+    host.bind(page.asPage(), "target-1", true)
+    expect(page.defaultTimeoutMs).toBe(240_000)
+
+    page.currentUrl = "https://example.com/next"
+    page.emit("framenavigated", page.frame)
+    await settle()
+    expect(page.defaultTimeoutMs).toBe(240_000)
+
+    host.restoreActionTimeoutNow()
+    expect(page.defaultTimeoutMs).toBe(30_000)
+  })
+
+  test("the closed-page replacement guard restores the current action timeout after a navigation", async () => {
+    const page = new FakePage()
+    let cleared = false
+    let actionTimeoutMs = 240_000
+    installClosedPageReplacementGuard(page.asPage(), () => {
+      cleared = true
+    }, () => actionTimeoutMs)
+    expect(page.defaultTimeoutMs).toBe(2_500)
+
+    await page.goto()
+    expect(cleared).toBe(true)
+    expect(page.defaultTimeoutMs).toBe(240_000)
+
+    // A later call's budget, not the one the guard was installed with.
+    actionTimeoutMs = 90_000
+    await page.goto()
+    expect(page.defaultTimeoutMs).toBe(90_000)
+  })
+
+  test("a recreated page keeps its 2.5s guard through the call's apply and restore", async () => {
+    const host = new TestHost()
+    const page = new FakePage("https://example.com/", "target-1")
+    host.bind(page.asPage(), "target-1", true)
+    page.emit("close")
+    const created = new FakePage("about:blank", "target-2")
+    const context = asContext({ pages: () => [], newPage: async () => created.asPage() })
+    host.raiseActionTimeout(240_000)
+
+    const recreated = await host.sessionPage(context)
+    expect(recreated).toBe(created.asPage())
+    expect(created.defaultTimeoutMs).toBe(2_500)
+
+    host.armActionTimeout(recreated)
+    expect(created.defaultTimeoutMs).toBe(2_500)
+    host.restoreActionTimeoutNow()
+    expect(created.defaultTimeoutMs).toBe(2_500)
+  })
+
+  test("a recreated page takes the current action timeout once it navigates", async () => {
+    const host = new TestHost()
+    const page = new FakePage("https://example.com/", "target-1")
+    host.bind(page.asPage(), "target-1", true)
+    page.emit("close")
+    const created = new FakePage("about:blank", "target-2")
+    const context = asContext({ pages: () => [], newPage: async () => created.asPage() })
+    host.raiseActionTimeout(240_000)
+
+    expect(await host.sessionPage(context)).toBe(created.asPage())
+    expect(created.defaultTimeoutMs).toBe(2_500)
+
+    await created.goto()
+    expect(created.defaultTimeoutMs).toBe(240_000)
+
+    host.restoreActionTimeoutNow()
+    expect(created.defaultTimeoutMs).toBe(30_000)
+  })
+
   test("a stale page's close event is ignored after a rebind", () => {
     const host = new TestHost()
     const first = new FakePage("https://first.example/")
@@ -355,6 +456,44 @@ describe("DefaultPageHost relay reports", () => {
     expect(host.warnings()).toEqual([defaultPageClosedWarning])
   })
 
+  test("markTargetDetached for a debugging bar dismissal names it, and not a closed page", async () => {
+    const host = new TestHost()
+    host.bind(new FakePage().asPage(), "target-1", true)
+
+    expect(host.markTargetDetached("target-1", { releasedByUser: true })).toBe(true)
+
+    expect(host.targetId()).toBeUndefined()
+    // The page was released, not closed: later locator failures must not say it "was closed".
+    expect(host.recreatedUrl()).toBeUndefined()
+    expect(host.warnings()).toEqual([debuggingBarDismissedWarning])
+    // A stopped script's discarded result can drain the queued warning; the next execute says it again.
+    expect(host.drainWarnings()).toEqual([debuggingBarDismissedWarning])
+    const created = new FakePage("https://new.example/", "target-8")
+    const context = asContext({ pages: () => [], newPage: async () => created.asPage() })
+
+    await host.sessionPage(context)
+
+    expect(host.warnings()).toEqual([debuggingBarDismissedWarning])
+  })
+
+  test("rebinding to another tab drops a stale debugging bar notice", async () => {
+    const host = new TestHost()
+    host.bind(new FakePage().asPage(), "target-1", true)
+    host.markTargetDetached("target-1", { releasedByUser: true })
+    host.drainWarnings()
+    // The session adopts another tab instead, so the released page's notice no longer applies.
+    const adopted = new FakePage("https://adopted.example/", "target-2")
+    host.bind(adopted.asPage(), "target-2", true)
+    adopted.closed = true
+    adopted.emit("close")
+    const created = new FakePage("https://new.example/", "target-3")
+    const context = asContext({ pages: () => [], newPage: async () => created.asPage() })
+
+    await host.sessionPage(context)
+
+    expect(host.warnings()).toEqual([])
+  })
+
   test("markTargetReplaced keeps ownership and asks for the replaced rebind", () => {
     const host = new TestHost()
     host.bind(new FakePage().asPage(), "old", true)
@@ -395,6 +534,47 @@ describe("DefaultPageHost recovery", () => {
     expect(host.targetId()).toBe("target-7")
     expect(host.ownsBoundPage()).toBe(true)
     expect(host.changes.at(-1)).toEqual({ id: "target-7", owner: "relay" })
+  })
+
+  test("a target id that couldn't be resolved is recorded on a later execute", async () => {
+    const host = new TestHost()
+    // The first probe fails inside its timeout, as a page still loading after a browser transition does.
+    const page = new FakePage("https://late.example/", "")
+    const context = asContext({ pages: () => [], newPage: async () => page.asPage() })
+
+    expect(await host.sessionPage(context)).toBe(page.asPage())
+    expect(host.targetId()).toBeUndefined()
+
+    page.targetId = "target-late"
+    expect(await host.sessionPage(context)).toBe(page.asPage())
+    expect(host.targetId()).toBe("target-late")
+    expect(host.changes.at(-1)).toEqual({ id: "target-late", owner: "relay" })
+  })
+
+  test("the late target-id probe is bounded, so a page that never identifies costs no more time", async () => {
+    const host = new TestHost()
+    const page = new FakePage("https://late.example/", "")
+    const context = asContext({ pages: () => [], newPage: async () => page.asPage() })
+
+    expect(await host.sessionPage(context)).toBe(page.asPage())
+    expect(page.targetProbes).toBe(1)
+    for (let attempt = 0; attempt < 4; attempt++) await host.sessionPage(context)
+    // Three retries, not one per execute forever.
+    expect(page.targetProbes).toBe(4)
+  })
+
+  test("closing a page whose target was identified later remembers it for reattach", async () => {
+    const host = new TestHost()
+    const page = new FakePage("https://late.example/", "")
+    const context = asContext({ pages: () => [], newPage: async () => page.asPage() })
+    host.bind(page.asPage(), undefined, true)
+
+    page.targetId = "target-close"
+    expect(await host.sessionPage(context)).toBe(page.asPage())
+    page.closed = true
+    page.emit("close")
+
+    expect(host.rememberedClosedPage()).toEqual({ targetId: "target-close", ownsPage: true })
   })
 
   test("getSessionPage reattaches the closed default page's tab under the same target", async () => {

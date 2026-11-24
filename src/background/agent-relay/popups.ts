@@ -1,4 +1,5 @@
 import type { JsonObject } from "../../agent-relay/protocol"
+import { MUTE_TABS_KEY, muteTabs } from "../../shared/protocol"
 import { AgentWindow } from "./window"
 import { TabCleanup } from "../tab-cleanup"
 import { text, type AgentRelayLog } from "./wire"
@@ -39,7 +40,8 @@ export function installPopupAdoption(deps: {
     if (!(await TabCleanup.isTracked(opener))) return
     const tab = await chrome.tabs.get(tabId).catch(() => undefined)
     if (!tab) return
-    void chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => undefined)
+    const muted = muteTabs((await chrome.storage.local.get(MUTE_TABS_KEY))[MUTE_TABS_KEY]) === "on"
+    void chrome.tabs.update(tabId, { autoDiscardable: false, ...(muted ? { muted: true } : {}) }).catch(() => undefined)
     const [agentWindow, openerWindow] = await Promise.all([
       AgentWindow.id(),
       chrome.tabs.get(opener).then((openerTab) => openerTab.windowId, () => undefined),
@@ -87,8 +89,9 @@ export function installPopupAdoption(deps: {
       .catch((error: unknown) => deps.log.add("tab.opened.error", { error: text(error) }))
       // Once it's moved and grouped: the relay attaches it as a page of the opener's session, so the agent's
       // Playwright sees it (page.waitForEvent("popup"), context.pages()).
-      .finally(() => {
-        if (deps.relayTabs.has(sourceTabId)) deps.send({ method: "tabs.opened", params: { tabId, openerTabId: sourceTabId } })
+      .finally(async () => {
+        if (!deps.relayTabs.has(sourceTabId)) return
+        deps.send({ method: "tabs.opened", params: { tabId, openerTabId: sourceTabId } })
       })
   })
 }

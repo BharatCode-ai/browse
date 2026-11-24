@@ -1,6 +1,6 @@
 import { Effect } from "effect"
 import type { BrowserLink, BrowserLinks } from "./browser-links.ts"
-import type { HandoffPageTarget } from "../execute.ts"
+import { debuggingBarDismissedStop, type HandoffPageTarget } from "../execute.ts"
 import type { ExtensionCommandInput } from "./rpc.ts"
 import {
   awaitHandoffAction,
@@ -24,6 +24,14 @@ export type TabGroupingMethod = "tabs.group" | "tabs.ungroup"
 export const attachedBadge = { text: "ON", color: "#7c3aed", title: "Detach from browse" }
 export const executingBadge = { text: "RUN", color: "#f59e0b", title: "browse is running a script. Click to stop it and take this tab back." }
 export const waitingBadge = (message: string) => ({ text: "WAIT", color: "#2563eb", title: `browse is waiting for you: ${message} Click here when you're done.` })
+
+/**
+ * Whether a session keeps focus emulation on for this tab between calls: only a keepVisible session, and only a tab it
+ * opened itself (relay-owned), never a tab the user lent it.
+ */
+export function keepsTabVisible(sessionId: string, keepVisible: boolean, target: ConnectedTarget | undefined): boolean {
+  return keepVisible && target?.owner === "relay" && target.opencodeBrowserSessionId === sessionId
+}
 
 export function createTabPresentation(options: {
   readonly registry: TargetRegistry
@@ -273,7 +281,15 @@ export function createTabPresentation(options: {
       }
       activeHandoffTabs.delete(sessionId)
     }
-    return executing ? Effect.void : tabActivity.finish(sessionId)
+    return executing ? Effect.void : tabActivity.finish(sessionId, { keep: (tabId) => keepsVisible(sessionId, tabId) })
+  }
+
+  /**
+   * A keepVisible session keeps focus emulation on for the tabs it opened itself, never for a tab the user lent it,
+   * so pages that disconnect while hidden stay connected between calls without changing what the user lent.
+   */
+  function keepsVisible(sessionId: string, tabId: number): boolean {
+    return keepsTabVisible(sessionId, getSessions().keepsTabsVisible(sessionId), registry.tabTargets.get(tabId))
   }
 
   function handleToolbarClick(tabId: number): void {
@@ -301,6 +317,22 @@ export function createTabPresentation(options: {
     Effect.runPromise(toggleTab(tabId)).catch((error: unknown) => {
       console.error("Toolbar toggle failed", error)
     })
+  }
+
+  /**
+   * The user clicked the browser's debugging bar button, which detaches the debugger and leaves the tab open. A
+   * script running on the tab is stopped with a message naming what happened; the tab itself is released by the
+   * caller (detachTargetState with releasedByUser).
+   */
+  function handleDebuggingBarCancel(tabId: number): void {
+    const sessions = getSessions()
+    const target = registry.tabTargets.get(tabId)
+    if (!target) return
+    const sessionId = pageStatusSessionId(target) ?? activeHandoffSessionIdForTab(tabId)
+    if (sessionId && sessions.isExecuting(sessionId)) {
+      relayLog("execute.stopped", { tabId, session: sessionId, from: "debugging-bar" })
+      sessions.stopExecution(sessionId, debuggingBarDismissedStop, "debugging-bar-cancel")
+    }
   }
 
   function presentAttachedTarget(committedTarget: ConnectedTarget): void {
@@ -338,6 +370,7 @@ export function createTabPresentation(options: {
     requestHandoff,
     onSessionExecuteStateChange,
     handleToolbarClick,
+    handleDebuggingBarCancel,
     presentAttachedTarget,
   }
 }

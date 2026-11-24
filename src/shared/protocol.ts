@@ -75,9 +75,54 @@ export type ProtocolSkew = "update-cli" | "update-extension"
 
 export type AutoUpdateMode = "on" | "notify" | "off"
 export const autoUpdateMode = (value: unknown): AutoUpdateMode | undefined => (value === "on" || value === "notify" || value === "off" ? value : undefined)
+/**
+ * How this CLI was installed, as kinds extensions have always known: binary and npm global installs update themselves.
+ * Older relays send only npm, checkout or other. A bun, pnpm, yarn or volta global install reads as binary (it updates
+ * itself, and `browse update` updates it), a bunx, pnpm dlx or yarn dlx run as npx; `method` names it exactly.
+ */
+export type RelayInstall = "binary" | "npm" | "npx" | "checkout" | "other"
+/** The exact install method a newer relay reports beside `install`. */
+export type RelayInstallMethod =
+  | "binary"
+  | "npm"
+  | "bun"
+  | "pnpm"
+  | "yarn"
+  | "volta"
+  | "npx"
+  | "bunx"
+  | "pnpm-dlx"
+  | "yarn-dlx"
+  | "checkout"
+  | "other"
+export const relayInstallMethods: readonly RelayInstallMethod[] = [
+  "binary",
+  "npm",
+  "bun",
+  "pnpm",
+  "yarn",
+  "volta",
+  "npx",
+  "bunx",
+  "pnpm-dlx",
+  "yarn-dlx",
+  "checkout",
+  "other",
+]
+/**
+ * Installs that update themselves (the install script's binary, or a global install its package manager updates), whose
+ * update mode the options page offers. Bun, pnpm, yarn and volta installs report `install: "binary"` for older pages.
+ */
+export const selfUpdatingInstall = (update: Pick<RelayAutoUpdate, "install" | "method"> | undefined): boolean =>
+  update?.install === "npm" || update?.install === "binary"
+/** The last installer attempt that failed, which version it was for, and when. */
+export type RelayUpdateFailure = { message: string; at: string; version?: string; attempts?: number }
 /** The relay's update state: an npm install updates itself; a checkout updates with `update`. */
 export type RelayAutoUpdate = {
-  install: "npm" | "checkout" | "other"
+  install: RelayInstall
+  method?: RelayInstallMethod
+  /** The command that updates this install in a terminal (or switches one that can't update to one that can). */
+  updateCommand?: string
   /** The command that runs the relay's CLI in a terminal: `browse` for a binary install, `npx @opencode/browse` for npm. */
   cli?: string
   mode: AutoUpdateMode
@@ -86,8 +131,71 @@ export type RelayAutoUpdate = {
   version?: string
   channel?: string
   latest?: string
+  /** When the relay first saw `latest` (ISO 8601), so an update that never lands can be noticed. */
+  latestAt?: string
+  /** When the relay last checked for a release (ISO 8601). */
+  checkedAt?: string
   pending?: string
   previous?: string
+  lastError?: RelayUpdateFailure
+}
+
+/** An optional update that stayed pending this long is told to the user rather than waited on quietly. */
+export const AUTO_UPDATE_PENDING_MS = 24 * 60 * 60 * 1000
+
+export type CliUpdateNotice = {
+  current: string
+  latest: string
+  /** Why the CLI is behind: the install can't update itself, updates are off/notify, the last attempt failed, or it stayed pending. */
+  reason: "install" | "mode" | "failed" | "pending"
+  /** The command that updates this install in a terminal. */
+  command: string
+}
+
+/**
+ * The command that updates a CLI install: the relay's own when it names one; else binary and checkout update in place,
+ * npm global and npx install the latest package.
+ */
+export function cliUpdateCommand(update: Pick<RelayAutoUpdate, "install" | "cli" | "updateCommand">): string {
+  if (update.updateCommand?.trim()) return update.updateCommand.trim()
+  if (update.install === "npm") return "npm install -g @opencode/browse@latest"
+  if (update.install === "npx") return "npx @opencode/browse@latest install"
+  return `${update.cli?.trim() || "browse"} update`
+}
+
+/** Orders the relay's versions as semver does for these shapes: dev below beta below the release, then by run. */
+function versionOrder(value: string): number[] | undefined {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-(dev|beta)\.(\d+)(?:\.(\d+))?)?$/.exec(value)
+  if (!match) return undefined
+  const stage = match[4] === undefined ? 2 : match[4] === "beta" ? 1 : 0
+  return [Number(match[1]), Number(match[2]), Number(match[3]), stage, Number(match[5] ?? 0), Number(match[6] ?? 0)]
+}
+
+/** Whether `latest` names another build than `current`, ordering known version shapes and treating anything else as different. */
+export function newerCliVersion(latest: string, current: string): boolean {
+  if (latest === current) return false
+  const a = versionOrder(latest)
+  const b = versionOrder(current)
+  if (!a || !b) return true
+  for (let index = 0; index < a.length; index++) if (a[index] !== b[index]) return a[index]! > b[index]!
+  return false
+}
+
+/**
+ * The CLI update the status pages and toolbar should mention, or undefined while there's nothing to say. A normal
+ * pending auto-update stays quiet: only an install that can't update itself, updates that are off or notify-only, a
+ * failed attempt, or a release that stayed uninstalled for a day is told to the user.
+ */
+export function cliUpdateNotice(update: RelayAutoUpdate | undefined, now = Date.now()): CliUpdateNotice | undefined {
+  const { version: current, latest } = update ?? {}
+  if (!update || !current || !latest || !newerCliVersion(latest, current)) return undefined
+  const failed = update.lastError !== undefined && (update.lastError.version === undefined || update.lastError.version === latest)
+  const selfUpdating = update.install === "binary" || update.install === "npm"
+  const since = update.latestAt === undefined ? undefined : Date.parse(update.latestAt)
+  const stale = since !== undefined && Number.isFinite(since) && now - since > AUTO_UPDATE_PENDING_MS
+  const reason = failed ? "failed" : !selfUpdating ? "install" : update.effective !== "on" ? "mode" : stale ? "pending" : undefined
+  if (!reason) return undefined
+  return { current, latest, reason, command: cliUpdateCommand(update) }
 }
 
 export type AgentRelayUpdate = { summary: string; command: string }
@@ -108,21 +216,26 @@ export const AGENT_GROUPING_KEY = "agentTabsGrouping"
 export type AgentGrouping = "session" | "shared" | "none"
 export const agentGrouping = (value: unknown): AgentGrouping => (value === "session" || value === "none" ? value : "shared")
 
+/** Whether browse collapses agent groups by itself: "auto" (default), or "off" to leave each group as the user set it. */
+export const AGENT_GROUP_COLLAPSE_KEY = "agentTabsGroupCollapse"
+export type AgentGroupCollapse = "auto" | "off"
+export const agentGroupCollapse = (value: unknown): AgentGroupCollapse => (value === "off" ? "off" : "auto")
+
 /** Minutes an agent tab may sit untouched before it closes; 0 never closes them automatically. */
 export const IDLE_MINUTES_KEY = "tabCleanupIdleMinutes"
 export const DEFAULT_IDLE_MINUTES = 10
 export const idleMinutesSetting = (value: unknown): number =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : DEFAULT_IDLE_MINUTES
 
-/** Whether the relay draws the agent (ghost) cursor on agent tabs outside recordings: "off" (default) or "always". */
-export const AGENT_CURSOR_KEY = "agentCursor"
-export type AgentCursor = "off" | "always"
-export const agentCursor = (value: unknown): AgentCursor => (value === "always" ? "always" : "off")
-
 /** Whether the relay sends human-like input (curved paths, paced keys): "on" (default) or "off". */
 export const HUMAN_INPUT_KEY = "humanInput"
 export type HumanInput = "on" | "off"
 export const humanInput = (value: unknown): HumanInput => (value === "off" ? "off" : "on")
+
+/** Whether tabs agents open are muted: "on", or "off" (default). */
+export const MUTE_TABS_KEY = "muteTabs"
+export type MuteTabs = "on" | "off"
+export const muteTabs = (value: unknown): MuteTabs => (value === "on" ? "on" : "off")
 
 /** When a handoff shows a system notification: only on a recorded tab (default), or on every handoff. */
 export const HANDOFF_NOTIFICATIONS_KEY = "handoffNotifications"
@@ -130,10 +243,10 @@ export type HandoffNotifications = "recording" | "always"
 export const handoffNotifications = (value: unknown): HandoffNotifications => (value === "always" ? "always" : "recording")
 
 /** The settings the relay applies, sent to it after pairing and whenever they change (the `settings` event). */
-export type RelaySettings = { cursor: AgentCursor; humanInput: HumanInput }
+export type RelaySettings = { humanInput: HumanInput }
 
 /** Settings the relay's environment fixes, whatever the status page says (the relay's `relay.settings` answer). */
-export type RelayOverrides = { agentWindow?: "current" | "separate"; cursor?: AgentCursor; humanInput?: HumanInput }
+export type RelayOverrides = { agentWindow?: "current" | "separate"; humanInput?: HumanInput }
 
 export const STATUS_PORT = "opencode-browser.status"
 
@@ -147,6 +260,6 @@ export type FromStatusPage =
   | { type: "relay.connect"; address: string; code: string }
   | { type: "agents.reconnect" }
   | { type: "tabs.cleanup" }
-  /** A one-time code from install's link (welcome.html#code=…). */
-  | { type: "pairing.link"; code: string }
+  /** A one-time code from install's link (welcome.html#code=…), and the relay port when it isn't 19988. */
+  | { type: "pairing.link"; code: string; port?: number }
   | { type: "autoUpdate.set"; mode: AutoUpdateMode }
