@@ -5,7 +5,9 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import * as clack from "@clack/prompts"
 import type { AgentName, AgentReceipt } from "./agent-config.ts"
+import { writeStdout } from "../cli/output.ts"
 import { formatPairingCode } from "../relay/browser-pairing.ts"
+import { defaultPort } from "../relay/helpers.ts"
 import {
   cacheRoot,
   configRoot as browseConfigRoot,
@@ -35,7 +37,7 @@ export const windows = process.platform === "win32"
 export const home = homedir()
 export const root = dataRoot()
 export const configRoot = process.env.XDG_CONFIG_HOME ?? path.join(home, ".config")
-/** browse's own XDG folders (paths.ts): uninstall removes them, status and doctor show them. */
+/** browse's own XDG folders (paths.ts): uninstall removes them, status shows them. */
 export const paths = {
   config: browseConfigRoot(),
   data: dataRoot(),
@@ -90,8 +92,8 @@ export type Settings = {
 export const connectedMessage = "✓ Connected to your browser. Ask your agent to open a page."
 export const pairedOfflineMessage =
   "! Not connected yet. Open the browser profile already paired with browse and make sure the extension is enabled. It reconnects automatically."
-export const manualPair = (code: string) =>
-  `Open the Extensions menu → browse → Options, enter ${formatPairingCode(code)} as the pairing code, then click Pair.`
+export const manualPair = (code: string, port = defaultPort, address?: string) =>
+  `Open the Extensions menu → browse → Options, expand advanced (or click Pair with a code), enter ${formatPairingCode(code)} as the pairing code${address ? ` and ${address} as the relay address` : port === defaultPort ? "" : ` and localhost:${port} as the relay address`}, then click Connect.`
 
 export function flag(args: string[], name: string) {
   const index = args.indexOf(name)
@@ -135,7 +137,7 @@ export const tilde = (file: string) => (file === home || file.startsWith(home + 
 export const rail: { active: boolean; waiting?: ReturnType<typeof clack.spinner> | undefined } = { active: false }
 
 export function log(line: string) {
-  if (!rail.active) return void process.stdout.write(line + "\n")
+  if (!rail.active) return writeStdout(line + "\n")
   if (!line.trim()) return
   const ok = line.startsWith("✓ ")
   const warn = line.startsWith("! ")

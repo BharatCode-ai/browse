@@ -3,7 +3,7 @@ import { defaultPageClosedWarning, type ExecuteResult } from "../execute.ts"
 import { cliCommand } from "../paths.ts"
 import type { AuthenticatedJsonOutcome, AuthenticatedJsonRequest } from "../relay/schema.ts"
 import type { ConnectedTarget, OpenCodeBrowserSession, SessionSummary, SessionTarget } from "../relay/types.ts"
-import type { PersistedSession } from "./catalog.ts"
+import type { PersistedRelayTarget, PersistedSession } from "./catalog.ts"
 import type { SessionAdmission } from "./admission.ts"
 import type { TargetOwnershipChange } from "../cdp/target-registry.ts"
 
@@ -17,7 +17,7 @@ export type SessionExecuteRecord = {
 }
 
 export type CreatedSessionSummary = SessionSummary & { readonly created?: boolean }
-export type SessionCreateOptions = { readonly readOnly?: boolean; readonly allowedOrigins?: readonly string[]; readonly browser?: string }
+export type SessionCreateOptions = { readonly readOnly?: boolean; readonly allowedOrigins?: readonly string[]; readonly keepVisible?: boolean; readonly browser?: string }
 
 export interface SessionContext {
   readonly sessions: Map<string, OpenCodeBrowserSession>
@@ -40,6 +40,14 @@ export type AdoptionResult = {
 }
 
 export const defaultExecuteTimeoutMs = 60_000
+/** How long relay shutdown waits for accepted session work before leaving it behind. */
+export const defaultShutdownTimeoutMs = 3_000
+
+/** A session still holding tracked work when shutdown's bounded wait expired. */
+export type PendingSessionWork = {
+  readonly sessionId: string
+  readonly pending: number
+}
 
 export type SessionHooks = {
   readonly checkBrowserResponsive?: (key: string) => Effect.Effect<void, Error>
@@ -50,6 +58,8 @@ export type SessionHooks = {
   readonly onExecuteStateChange?: (sessionId: string, executing: boolean) => void | Effect.Effect<void>
   /** Called after each execute completes, for journaling. Failure is logged and ignored. */
   readonly onExecuteRecord?: (record: SessionExecuteRecord) => unknown | Promise<unknown>
+  /** Called after a session is deleted or reset, to drop state keyed by it. Failure is logged and ignored. */
+  readonly onSessionDeleted?: (sessionId: string) => void
   /** How long lifecycle commands wait for a permit or sandbox operation. */
   readonly lifecycleTimeoutMs?: number
   /** Overall budget for a single execute call (paused while handoff waits on the user); 0 disables. */
@@ -62,6 +72,12 @@ export type SessionHooks = {
   readonly onTargetOwnershipChange?: (change: TargetOwnershipChange) => void
   /** Close a live relay-owned target by its durable target id. */
   readonly onReleaseRelayTarget?: (targetId: string) => Effect.Effect<void, Error>
+  /** A session's durable default target was cleared (a closed tab, a debugging-bar release): say why it went. */
+  readonly onTargetCleared?: (sessionId: string, targetId: string, reason: string) => void
+  /** A catalog entry was dropped while restoring (a duplicate, a conflicting target): say why, without failing startup. */
+  readonly onRestoreWarning?: (message: string) => void
+  /** A deleted session's restored targets are gone from the catalog; a reconnect must close them. */
+  readonly onTombstoneRelayTargets?: (sessionId: string, targetIds: readonly string[], browserKey: string | undefined) => void
   /** Target ids of every live relay-owned page of a session: its default page and the pages and popups it opened. */
   readonly relayTargetIdsForSession?: (sessionId: string) => readonly string[]
   /** Live root targets currently attached to the relay. */
@@ -70,6 +86,18 @@ export type SessionHooks = {
   readonly onSessionsChanged?: (sessions: readonly PersistedSession[]) => unknown | Promise<unknown>
   /** Cancel the session's pending handoff so its waiter fails; true when one was pending. */
   readonly onCancelSessionHandoff?: (sessionId: string) => boolean
+  /** The session's pending handoff, included in its summary while it waits on the user. */
+  readonly pendingHandoff?: (sessionId: string) => {
+    readonly message: string
+    readonly tabId: number
+    readonly startedAt: string
+  } | undefined
+  /**
+   * End any navigation still pending on the session's tabs before the stopped script's browser connection closes.
+   * Chromium handles `Page.stopLoading` in the browser process, so it answers (and releases queued commands) even
+   * while a `Page.navigate` to a server that never responds is still in flight.
+   */
+  readonly onStoppingExecute?: (session: OpenCodeBrowserSession) => Effect.Effect<void>
   /** How long a stopped script may take to settle before its sandbox is abandoned and the execute lock released. */
   readonly stopGraceMs?: number
 }
@@ -194,8 +222,9 @@ export function stoppedExecuteResult(message: string, diagnostic: string): Execu
   }
 }
 
-export function sessionSummary(session: OpenCodeBrowserSession): SessionSummary {
+export function sessionSummary(session: OpenCodeBrowserSession, hooks?: SessionHooks): SessionSummary {
   const status = session.sandbox.getStatus()
+  const handoff = hooks?.pendingHandoff?.(session.id)
   return {
     id: session.id,
     createdAt: session.createdAt,
@@ -205,27 +234,42 @@ export function sessionSummary(session: OpenCodeBrowserSession): SessionSummary 
     stateKeys: status.stateKeys,
     ...(session.readOnly ? { readOnly: true } : {}),
     ...(session.allowedOrigins ? { allowedOrigins: [...session.allowedOrigins] } : {}),
+    ...(session.keepVisible ? { keepVisible: true } : {}),
     ...(session.browser ? { browser: session.browser.id } : {}),
+    ...(handoff ? { handoff } : {}),
   }
 }
 
-export function createdSummary(session: OpenCodeBrowserSession, created: boolean): CreatedSessionSummary {
+export function createdSummary(session: OpenCodeBrowserSession, created: boolean, hooks?: SessionHooks): CreatedSessionSummary {
   return {
-    ...sessionSummary(session),
+    ...sessionSummary(session, hooks),
     ...(created ? { created: true } : {}),
   }
 }
 
-export function persistedSession(session: OpenCodeBrowserSession): PersistedSession {
+export function persistedSession(session: OpenCodeBrowserSession, hooks?: Pick<SessionHooks, "relayTargetIdsForSession">): PersistedSession {
   const target: SessionTarget | undefined = session.target
+  // Every relay-owned page the session holds survives a relay restart, not just its default page. Older relays
+  // ignore `targets`; older catalogs without it still load.
+  const targets = new Map<string, PersistedRelayTarget>()
+  if (target?.owner === "relay") targets.set(target.id, { id: target.id, owner: "relay" })
+  for (const held of session.targets ?? []) {
+    if (held.owner === "relay") targets.set(held.id, { id: held.id, owner: "relay" })
+  }
+  for (const id of hooks?.relayTargetIdsForSession?.(session.id) ?? []) {
+    if (!targets.has(id)) targets.set(id, { id, owner: "relay" })
+  }
+  const ownedTargets = Array.from(targets.values())
   return {
     id: session.id,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
     readOnly: session.readOnly,
     ...(session.allowedOrigins ? { allowedOrigins: [...session.allowedOrigins] } : {}),
+    ...(session.keepVisible ? { keepVisible: true } : {}),
     ...(session.browser ? { browser: session.browser.id, ...(session.browser.key ? { browserKey: session.browser.key } : {}) } : {}),
     ...(target ? { target } : {}),
+    ...(ownedTargets.length > 0 ? { targets: ownedTargets } : {}),
     ...(session.clientPid === undefined ? {} : { clientPid: session.clientPid }),
   }
 }

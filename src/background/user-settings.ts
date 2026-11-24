@@ -1,30 +1,33 @@
 export * as UserSettings from "./user-settings"
 import type { JsonObject } from "../agent-relay/protocol"
 import {
-  AGENT_CURSOR_KEY,
   AGENT_GROUPING_KEY,
+  AGENT_GROUP_COLLAPSE_KEY,
   AGENT_WINDOW_KEY,
   HANDOFF_NOTIFICATIONS_KEY,
   HUMAN_INPUT_KEY,
   IDLE_MINUTES_KEY,
-  agentCursor,
+  MUTE_TABS_KEY,
+  agentGroupCollapse,
   agentGrouping,
   agentWindowPlacement,
   handoffNotifications,
   humanInput,
   idleMinutesSetting,
+  muteTabs,
 } from "../shared/protocol"
 
 // The status page's settings for the relay's settings tool (`settings.get`, `settings.set`; cli/src/user-settings.ts).
 // They live in chrome.storage.local like the page's own changes, so the page follows them live and the background
-// applies them (and sends cursor and input to the relay) exactly as if the user had chosen them there.
+// applies them (and sends input to the relay) exactly as if the user had chosen them there.
 
 const keys = {
   window: AGENT_WINDOW_KEY,
   grouping: AGENT_GROUPING_KEY,
+  groupCollapse: AGENT_GROUP_COLLAPSE_KEY,
   idleMinutes: IDLE_MINUTES_KEY,
-  cursor: AGENT_CURSOR_KEY,
   humanInput: HUMAN_INPUT_KEY,
+  muteTabs: MUTE_TABS_KEY,
   handoffNotifications: HANDOFF_NOTIFICATIONS_KEY,
 } as const
 type Key = keyof typeof keys
@@ -33,9 +36,10 @@ type Key = keyof typeof keys
 const values: Record<Key, readonly (string | number)[]> = {
   window: ["current", "separate"],
   grouping: ["session", "shared", "none"],
+  groupCollapse: ["auto", "off"],
   idleMinutes: [10, 30, 60, 0],
-  cursor: ["off", "always"],
   humanInput: ["on", "off"],
+  muteTabs: ["on", "off"],
   handoffNotifications: ["recording", "always"],
 }
 
@@ -46,9 +50,10 @@ export async function read(): Promise<JsonObject> {
     settings: {
       window: agentWindowPlacement(stored[AGENT_WINDOW_KEY]),
       grouping: agentGrouping(stored[AGENT_GROUPING_KEY]),
+      groupCollapse: agentGroupCollapse(stored[AGENT_GROUP_COLLAPSE_KEY]),
       idleMinutes: idleMinutesSetting(stored[IDLE_MINUTES_KEY]),
-      cursor: agentCursor(stored[AGENT_CURSOR_KEY]),
       humanInput: humanInput(stored[HUMAN_INPUT_KEY]),
+      muteTabs: muteTabs(stored[MUTE_TABS_KEY]),
       handoffNotifications: handoffNotifications(stored[HANDOFF_NOTIFICATIONS_KEY]),
     },
   }

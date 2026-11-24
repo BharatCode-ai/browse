@@ -23,7 +23,7 @@ export class StubEvent {
 
 type Bounds = { left: number; top: number; width: number; height: number }
 type Window = Bounds & { id: number; type: string; state: string; focused: boolean }
-type Tab = { id: number; windowId: number; url: string; active: boolean; index: number; groupId: number; pinned: boolean }
+type Tab = { id: number; windowId: number; url: string; pendingUrl?: string; active: boolean; index: number; groupId: number; pinned: boolean; muted: boolean; mutedInfo?: { muted: boolean; reason?: string; extensionId?: string }; lastAccessed: number }
 type Group = { id: number; windowId: number; title: string; color: string; collapsed: boolean }
 type CreateWindow = Partial<Bounds> & { url?: string; focused?: boolean; state?: string; type?: string }
 
@@ -83,6 +83,9 @@ function lenient<T extends object>(target: T, namespaces = false): T {
   })
 }
 
+/** The extension's id, as chrome.runtime.id answers: a mute browse set is recorded against it. */
+const RUNTIME_ID = "stubextensionid"
+
 export function createChrome() {
   let nextId = 100
   const windows = new Map<number, Window>()
@@ -95,14 +98,25 @@ export function createChrome() {
     groups,
     /** Every chrome.windows.update({ focused: true }) and chrome.tabs.update({ active: true }), in order. */
     activations: [] as ({ windowId: number } | { tabId: number })[],
+    /** Tab calls that change groups, in order, so tests can check ungroup comes before remove. */
+    calls: [] as string[],
     /** The displays chrome.windows.create bounds are checked against. */
     displays: [{ left: 0, top: 0, width: 1512, height: 982 }] as Bounds[],
     focusedWindowId: undefined as number | undefined,
+    /** The window getLastFocused answers with: focusedWindowId unless a test makes it answer with another one. */
+    lastFocusedWindowId: undefined as number | undefined,
+    /** Makes chrome.windows.getAll never settle, like a Chromium call Dia stalls. */
+    getAllHangs: false,
     created: [] as CreateWindow[],
     permissionLevel: "granted" as "granted" | "denied",
+    /** The extension's "Allow access to file URLs" setting. */
+    fileAccess: false,
     notificationsFail: false,
     notifications: new Map<string, unknown>(),
+    /** Every chrome.notifications.create call, so tests can see a burst coalesce (the map only keeps the last). */
+    notificationCreates: 0,
   }
+  const tabsOf = (windowId: number) => [...tabs.values()].filter((tab) => tab.windowId === windowId).map((tab) => ({ ...tab }))
   const windowsApi = lenient({
     WINDOW_ID_NONE: -1,
     onRemoved: new StubEvent(),
@@ -118,15 +132,22 @@ export function createChrome() {
       const tab = addTab(window.id, options.url ?? "about:blank", true)
       return { ...window, tabs: [{ ...tab }] }
     },
-    async get(id: number) {
+    async get(id: number, options: { populate?: boolean } = {}) {
       const window = windows.get(id)
       if (!window) throw new Error(`No window with id: ${id}.`)
+      return { ...window, ...(options.populate ? { tabs: tabsOf(window.id) } : {}) }
+    },
+    async getLastFocused(options: { windowTypes?: string[] } = {}) {
+      const id = state.lastFocusedWindowId ?? state.focusedWindowId
+      const window = id === undefined ? undefined : windows.get(id)
+      if (!window || (options.windowTypes && !options.windowTypes.includes(window.type))) throw new Error("No last-focused window")
       return { ...window }
     },
-    async getLastFocused() {
-      const window = state.focusedWindowId === undefined ? undefined : windows.get(state.focusedWindowId)
-      if (!window) throw new Error("No last-focused window")
-      return { ...window }
+    async getAll(options: { windowTypes?: string[]; populate?: boolean } = {}) {
+      if (state.getAllHangs) return new Promise<never>(() => {})
+      return [...windows.values()]
+        .filter((window) => !options.windowTypes || options.windowTypes.includes(window.type))
+        .map((window) => ({ ...window, ...(options.populate ? { tabs: tabsOf(window.id) } : {}) }))
     },
     async update(id: number, change: { focused?: boolean }) {
       const window = windows.get(id)
@@ -145,19 +166,31 @@ export function createChrome() {
       if (!windows.delete(id)) throw new Error(`No window with id: ${id}.`)
       for (const tab of tabs.values()) if (tab.windowId === id) tabs.delete(tab.id)
       windowsApi.onRemoved.emit(id)
+      dropEmptyGroups()
     },
   })
-  const addTab = (windowId: number, url: string, active: boolean) => {
+  const addTab = (windowId: number, url: string, active: boolean, lastAccessed = Date.now()) => {
     if (active) for (const other of tabs.values()) if (other.windowId === windowId) other.active = false
-    const tab: Tab = { id: nextId++, windowId, url, active, index: [...tabs.values()].filter((tab) => tab.windowId === windowId).length, groupId: -1, pinned: false }
+    const tab: Tab = { id: nextId++, windowId, url, active, index: [...tabs.values()].filter((tab) => tab.windowId === windowId).length, groupId: -1, pinned: false, muted: false, lastAccessed }
     tabs.set(tab.id, tab)
     return tab
   }
   const chrome = lenient({
+    extension: lenient({
+      isAllowedFileSchemeAccess: async () => state.fileAccess,
+    }),
+    debugger: lenient({
+      onDetach: new StubEvent(),
+      async attach() {},
+      async detach() {},
+      async sendCommand() {
+        return {}
+      },
+    }),
     runtime: lenient({
-      id: "stubextensionid",
+      id: RUNTIME_ID,
       lastError: undefined,
-      getURL: (file: string) => `chrome-extension://stubextensionid/${file.replace(/^\//, "")}`,
+      getURL: (file: string) => `chrome-extension://${RUNTIME_ID}/${file.replace(/^\//, "")}`,
       getManifest: () => ({ version: "0.0.0-test" }),
       getPlatformInfo: async () => ({ os: "mac", arch: "arm64", nacl_arch: "arm64" }),
       sendMessage: async () => undefined,
@@ -189,6 +222,9 @@ export function createChrome() {
           for (const other of tabs.values()) if (other.windowId === tab.windowId) other.active = false
         }
         Object.assign(tab, change)
+        // Like Chrome, muting records who did it, so only the extension's own mute can be undone.
+        if (change.muted !== undefined)
+          tab.mutedInfo = change.muted ? { muted: true, reason: "extension", extensionId: RUNTIME_ID } : { muted: false }
         return { ...tab }
       },
       async move(id: number, { windowId, index }: { windowId?: number; index: number }) {
@@ -201,29 +237,43 @@ export function createChrome() {
       },
       async group({ tabIds, groupId }: { tabIds: number | number[]; groupId?: number }) {
         const ids = Array.isArray(tabIds) ? tabIds : [tabIds]
+        if (groupId !== undefined && !groups.has(groupId)) throw new Error(`No group with id: ${groupId}`)
         const id = groupId ?? nextId++
         for (const tabId of ids) {
           const tab = tabs.get(tabId)
           if (!tab) throw new Error(`No tab with id: ${tabId}.`)
-          tab.groupId = id
+          if (tab.groupId !== id) {
+            tab.groupId = id
+            tabUpdated(tab)
+          }
         }
         // Like Chrome, a new group starts expanded, in its tabs' window.
         if (!groups.has(id)) groups.set(id, { id, windowId: tabs.get(ids[0]!)!.windowId, title: "", color: "grey", collapsed: false })
+        dropEmptyGroups()
         return id
       },
       async remove(tabIds: number | number[]) {
         for (const tabId of Array.isArray(tabIds) ? tabIds : [tabIds]) {
           const tab = tabs.get(tabId)
           if (!tab) throw new Error(`No tab with id: ${tabId}.`)
+          state.calls.push(`remove:${tabId}`)
           tabs.delete(tabId)
           ;((chrome.tabs as unknown as { onRemoved: StubEvent }).onRemoved).emit(tabId, { windowId: tab.windowId, isWindowClosing: false })
         }
+        dropEmptyGroups()
       },
       async ungroup(tabIds: number | number[]) {
         for (const tabId of Array.isArray(tabIds) ? tabIds : [tabIds]) {
           const tab = tabs.get(tabId)
-          if (tab) tab.groupId = -1
+          if (tab) {
+            state.calls.push(`ungroup:${tabId}`)
+            if (tab.groupId !== -1) {
+              tab.groupId = -1
+              tabUpdated(tab)
+            }
+          }
         }
+        dropEmptyGroups()
       },
     }),
     tabGroups: lenient({
@@ -258,6 +308,7 @@ export function createChrome() {
         return state.permissionLevel
       },
       async create(id: string, options: unknown) {
+        state.notificationCreates++
         if (state.notificationsFail) throw new Error("Notifications are blocked")
         state.notifications.set(id, options)
         return id
@@ -267,6 +318,17 @@ export function createChrome() {
       },
     }),
   }, true)
+  /** Chrome removes a group when its last tab is removed or ungrouped. Saved groups aren't modelled. */
+  const dropEmptyGroups = () => {
+    for (const group of [...groups.values()]) {
+      if ([...tabs.values()].some((tab) => tab.groupId === group.id)) continue
+      groups.delete(group.id)
+      ;((chrome.tabGroups as unknown as { onRemoved: StubEvent }).onRemoved).emit({ ...group })
+    }
+  }
+  const tabUpdated = (tab: Tab) => {
+    ;((chrome.tabs as unknown as { onUpdated: StubEvent }).onUpdated).emit(tab.id, { groupId: tab.groupId }, { ...tab })
+  }
   return { chrome, state }
 }
 
@@ -278,7 +340,19 @@ export type Stub = ReturnType<typeof createChrome>
  * instead of replacing the stub.
  */
 export function installChrome(): Stub {
-  const global = globalThis as { chrome?: unknown; __chromeStub?: Stub }
+  const global = globalThis as { chrome?: unknown; __chromeStub?: Stub; __browseFetchStubbed?: boolean }
+  // Isolated tests must never reach a real local relay: anything aimed at this computer gets a 404 unless the test
+  // installs its own fetch stub first. Other hosts pass through.
+  if (!global.__browseFetchStubbed) {
+    global.__browseFetchStubbed = true
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const host = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url).hostname
+      if (host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]")
+        return new Response("not found", { status: 404 })
+      return realFetch(input, init)
+    }) as typeof fetch
+  }
   global.__chromeStub ??= createChrome()
   global.chrome = global.__chromeStub.chrome
   return global.__chromeStub

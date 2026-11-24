@@ -6,8 +6,11 @@ import process from "node:process"
 import { fileURLToPath } from "node:url"
 import { browserUnresponsive, extensionProtocolAdvice, extensionReconnectAlarmPeriodMs } from "../protocol.ts"
 import * as RelayClient from "./client.ts"
+import { relayLog } from "./log.ts"
+import { relayPortPinned, configuredRelayPort, processAlive, readRelayState } from "./port.ts"
 import { RelayShutdownRequest, type ExtensionStatus, type RelayVersion } from "./schema.ts"
-import { compareVersions, installedRuntime, installedVersion } from "../update/local-runtime.ts"
+import { launchWindowsRelay, quoteWindowsArgument } from "./windows-launch.ts"
+import { compareVersions, installedRuntime, installedVersion } from "../update/auto-update.ts"
 import { cliCommand, compiledBinary, installCommand, scriptEntry } from "../paths.ts"
 import { opencodeBrowserBuildId } from "../version.ts"
 
@@ -29,13 +32,22 @@ export type EnsureRelayOptions = {
   readonly buildId?: string
   readonly retryTimes?: number
   readonly retryDelayMs?: number
+  /** The endpoint is fixed (an explicit endpoint, or a pinned port): a port held by another program stays a hard error. */
+  readonly pinned?: boolean
 }
 
 export function shouldWaitForExtensionReconnect(readiness: RelayReadiness): boolean {
   return readiness.started || readiness.waitForReconnect === true
 }
 
-class RelayStillRunning extends Error {}
+class RelayStillRunning extends Error {
+  /** The cut /version that made this a still-draining retry, so a spent budget reports the real port error. */
+  readonly cutProbe: RelayClient.RelayDecodeFailed | undefined
+  constructor(message: string, cutProbe?: RelayClient.RelayDecodeFailed) {
+    super(message)
+    this.cutProbe = cutProbe
+  }
+}
 
 class RelayStartFailed extends Schema.TaggedError<RelayStartFailed>()(
   "RelayLifecycle.RelayStartFailed",
@@ -59,7 +71,7 @@ export class ExtensionProtocolIncompatible extends Schema.TaggedError<ExtensionP
   },
 ) {}
 
-/** This process runs an installed runtime that the path now has a newer version behind (local-runtime.ts). */
+/** This process runs an installed runtime that the path now has a newer version behind (auto-update.ts). */
 function supersededRuntime(): boolean {
   try {
     const runtime = installedRuntime()
@@ -76,29 +88,59 @@ export function relayBuildProblem(version: RelayVersion, buildId = opencodeBrows
     return `Running relay does not report a build id; use \`${cliCommand("relay restart")}\` for upgrade guidance (${buildId}).`
   }
   if (version.buildId !== buildId) {
-    if (isNewerBuild(version.buildId, buildId)) {
-      return `Running relay build ${version.buildId} is newer than CLI build ${buildId}; refresh or restart this CLI or MCP client. Only use \`${cliCommand("relay restart")}\` from the current installation.`
-    }
+    // A newer relay serves older clients: after an update the relay restarts while a running MCP server keeps its old
+    // build. Its requests keep working until one the relay can't decode (olderMcpClientAdvice says what to do then).
+    if (isNewerBuild(version.buildId, buildId)) return undefined
     return `Running relay build ${version.buildId} does not match CLI build ${buildId}; run \`${cliCommand("relay restart")}\` when no agent is using the browser. This leaves browser tabs open but resets in-memory JavaScript state.`
   }
   return undefined
 }
 
+/** Whether the running relay is a later build than this client: the state after an automatic update. */
+export function relayIsNewerThanClient(version: RelayVersion, buildId = opencodeBrowserBuildId): boolean {
+  return version.buildId !== undefined && version.buildId !== buildId && isNewerBuild(version.buildId, buildId)
+}
+
+/**
+ * What an MCP tool call says when a newer relay answered one of this older server's requests in a way it can't use:
+ * the update restarted the relay, and the agent must start the new server rather than keep the old one running.
+ */
+export function olderMcpClientAdvice(version: RelayVersion, error: unknown, buildId = opencodeBrowserBuildId): string | undefined {
+  if (!relayIsNewerThanClient(version, buildId)) return undefined
+  const incompatible = error instanceof RelayClient.RelayDecodeFailed
+    ? error.path !== "/version"
+    : error instanceof RelayClient.RelayRejected &&
+      (error.status === 405 || error.status === 415 ||
+        (error.status === 404 && error.code === undefined) ||
+        (error.status === 400 && error.code === "invalid-request" &&
+          error.message.startsWith("Invalid ") && error.message.includes(" request:")))
+  if (!incompatible) return undefined
+  return "browse was updated, and the running relay can't serve this MCP server's older build. Reconnect browse in the agent so it starts the new version (in OpenCode: /mcps)."
+}
+
 export const ensureRelay = Effect.fn("RelayLifecycle.ensureRelay")(function* (options: EnsureRelayOptions) {
   const buildId = options.buildId ?? opencodeBrowserBuildId
-  const probe = options.relay.version
-  const initial = yield* Effect.result(probe)
-  if (Result.isSuccess(initial)) {
-    const buildProblem = relayBuildProblem(initial.success, buildId)
-    return {
-      version: initial.success,
-      started: false,
-      ...(buildProblem ? { buildProblem } : {}),
-    } satisfies RelayReadiness
+  const found = (version: RelayVersion, started: boolean): RelayReadiness => {
+    const buildProblem = relayBuildProblem(version, buildId)
+    return { version, started, ...(buildProblem ? { buildProblem } : {}) }
   }
-  const relayWasAbsent = isRelayUnreachable(initial.failure)
-  if (!relayWasAbsent && !isRelayStarting(initial.failure)) {
+  const initial = yield* Effect.result(options.relay.version)
+  if (Result.isSuccess(initial)) return found(initial.success, false)
+  const draining = relayDraining(initial.failure)
+  let relayWasAbsent = isRelayUnreachable(initial.failure) || isForeignListener(initial.failure, options.pinned)
+  if (!relayWasAbsent && !isRelayStarting(initial.failure) && !draining) {
     return yield* initial.failure
+  }
+
+  if (draining) {
+    // Another process already asked this relay to stop: wait for it like our own drain. A replacement is the ready
+    // relay; no replacement means it is gone, so start one as if it had been absent.
+    const recorded = liveRelayInstanceId()
+    const replacement = recorded === undefined
+      ? undefined
+      : yield* startPastDrain(waitForRelayExitOrReplacement({ ...options, instanceId: recorded }), options.pinned)
+    if (replacement !== undefined) return found(replacement, false)
+    relayWasAbsent = true
   }
 
   if (relayWasAbsent) {
@@ -114,18 +156,18 @@ export const ensureRelay = Effect.fn("RelayLifecycle.ensureRelay")(function* (op
     if (!supersededRuntime()) yield* options.start ?? startManagedRelay()
   }
   const version = yield* waitForRelayReady(options)
-  const buildProblem = relayBuildProblem(version, buildId)
-  return { version, started: relayWasAbsent, ...(buildProblem ? { buildProblem } : {}) } satisfies RelayReadiness
+  return found(version, relayWasAbsent)
 })
 
 function waitForRelayReady(options: EnsureRelayOptions): Effect.Effect<RelayVersion, Error | RelayClient.RelayClientError> {
+  const retry = (error: unknown) => isRelayStartingOrUnreachable(error) || isForeignListener(error, options.pinned)
   return options.relay.version.pipe(
     Effect.retry({
       times: options.retryTimes ?? 200,
       schedule: Schedule.spaced(options.retryDelayMs ?? 50),
-      while: isRelayStartingOrUnreachable,
+      while: retry,
     }),
-    Effect.mapError((error) => isRelayStartingOrUnreachable(error)
+    Effect.mapError((error) => retry(error)
       ? new RelayStartFailed({
         message: `browse relay did not start at ${options.relay.endpoint}`,
         endpoint: options.relay.endpoint,
@@ -148,6 +190,7 @@ export const restartRelay = Effect.fn("RelayLifecycle.restartRelay")(function* (
   readonly onShutdownAccepted?: Effect.Effect<void>
 }) {
   const buildId = options.buildId ?? opencodeBrowserBuildId
+  const absent = (error: unknown) => isRelayUnreachable(error) || isForeignListener(error, options.pinned)
   const initial = yield* Effect.result(options.relay.version)
   let original: RelayVersion | undefined
   let replacement: RelayVersion | undefined
@@ -156,8 +199,13 @@ export const restartRelay = Effect.fn("RelayLifecycle.restartRelay")(function* (
     original = initial.success
   } else if (isRelayStarting(initial.failure)) {
     original = yield* waitForRelayReady(options)
-  } else if (!isRelayUnreachable(initial.failure)) {
-    return yield* initial.failure
+  } else {
+    // Another process may already be draining the relay: wait for its exit or replacement rather than treating a cut
+    // /version as a foreign listener while relay.json still names a live process.
+    const recorded = relayDraining(initial.failure) ? liveRelayInstanceId() : undefined
+    if (recorded !== undefined) {
+      replacement = yield* startPastDrain(waitForRelayExitOrReplacement({ ...options, instanceId: recorded }), options.pinned)
+    } else if (!absent(initial.failure)) return yield* initial.failure
   }
 
   if (original) {
@@ -176,7 +224,10 @@ export const restartRelay = Effect.fn("RelayLifecycle.restartRelay")(function* (
 
     const confirmed = yield* Effect.result(options.relay.version)
     if (Result.isFailure(confirmed)) {
-      if (!isRelayUnreachable(confirmed.failure)) return yield* confirmed.failure
+      const recorded = relayDraining(confirmed.failure) ? liveRelayInstanceId() : undefined
+      if (recorded !== undefined) {
+        replacement = yield* startPastDrain(waitForRelayExitOrReplacement({ ...options, instanceId: recorded }), options.pinned)
+      } else if (!absent(confirmed.failure)) return yield* confirmed.failure
     } else if (!isSameRelayInstance(original, confirmed.success)) {
       replacement = confirmed.success
     } else {
@@ -198,7 +249,7 @@ export const restartRelay = Effect.fn("RelayLifecycle.restartRelay")(function* (
       else if (!isRelayUnreachable(shutdown.failure) && !isRelayInstanceChanged(shutdown.failure)) {
         return yield* shutdown.failure
       }
-      replacement = yield* waitForRelayExitOrReplacement({ ...options, version: original })
+      replacement = yield* waitForRelayExitOrReplacement({ ...options, instanceId: original.instanceId })
     }
   }
 
@@ -217,21 +268,51 @@ export const restartRelay = Effect.fn("RelayLifecycle.restartRelay")(function* (
 
 function waitForRelayExitOrReplacement(options: {
   readonly relay: RelayClient.Interface
-  readonly version: RelayVersion
+  readonly instanceId: string
   readonly retryTimes?: number
   readonly retryDelayMs?: number
+  readonly pinned?: boolean
 }): Effect.Effect<RelayVersion | undefined, Error | RelayClient.RelayClientError> {
+  /** relay.json still names the relay being replaced, and its process is alive: it hasn't finished draining. */
+  const stillRecorded = () => relayRecorded(options.instanceId)
   return options.relay.version.pipe(
-    Effect.flatMap((version) => isSameRelayInstance(options.version, version)
+    Effect.flatMap((version) => version.instanceId !== undefined && version.instanceId === options.instanceId
       ? Effect.fail(new RelayStillRunning("browse relay is still draining; no replacement was started"))
       : Effect.succeed(version)),
-    Effect.catch((error) => isRelayUnreachable(error) ? Effect.succeed(undefined) : Effect.fail(error)),
+    // A foreign listener appears at the endpoint the moment the draining relay stops answering on this port but before
+    // its relay.json goes. That is still this relay's shutdown, not an exit: starting a replacement now would hit the
+    // port the draining relay still holds on its fallback. A draining relay can also cut an in-flight /version
+    // (RelayDecodeFailed), which reads as foreign while its relay.json still names it.
+    Effect.catch((error) => {
+      if (isRelayUnreachable(error)) return Effect.succeed(undefined)
+      // While relay.json still names this relay, a decode failure is its drain, on a pinned or fallback port. Once the
+      // record is gone, a pinned port keeps the decode failure (a real foreign listener); a fallback port moves on.
+      if (error instanceof RelayClient.RelayDecodeFailed && stillRecorded()) {
+        return Effect.fail(new RelayStillRunning("browse relay is still draining; no replacement was started", error))
+      }
+      return isForeignListener(error, options.pinned) ? Effect.succeed(undefined) : Effect.fail(error)
+    }),
     Effect.retry({
       times: options.retryTimes ?? 200,
       schedule: Schedule.spaced(options.retryDelayMs ?? 50),
+      // The catch already classified the failure; its next attempt reads relay.json again.
       while: (error) => error instanceof RelayStillRunning || isRelayStarting(error),
     }),
+    // A budget spent on cut probes names the port, not a relay that never stopped answering.
+    Effect.mapError((error) => error instanceof RelayStillRunning ? error.cutProbe ?? error : error),
   )
+}
+
+/**
+ * A drain wait abandoned with a foreign-shaped probe on an unpinned port leaves the relay free to start on a fallback
+ * port, as before a drain was waited for at all; a pinned port keeps the error.
+ */
+function startPastDrain(
+  drain: Effect.Effect<RelayVersion | undefined, Error | RelayClient.RelayClientError>,
+  pinned?: boolean,
+): Effect.Effect<RelayVersion | undefined, Error | RelayClient.RelayClientError> {
+  return drain.pipe(Effect.catch((error) =>
+    isForeignListener(error, pinned) ? Effect.succeed(undefined) : Effect.fail(error)))
 }
 
 function isSameRelayInstance(left: RelayVersion, right: RelayVersion): boolean {
@@ -344,12 +425,19 @@ export function startManagedRelay(
         throw new Error("Cannot locate the browse CLI entrypoint")
       }
       const launch = managedRelayLaunch(entrypoint, executable, execArgv)
-      const { OPENCODE_BROWSER_RESTART_REQUEST_ID: _inheritedRestartRequestId, ...env } = relayEnvironment(process.env)
+      // relayEnvironment keeps every OPENCODE_BROWSER_ name, whatever its casing, so strip the inherited restart id
+      // case-insensitively here (the option below is then the only one).
+      const env = Object.fromEntries(
+        Object.entries(relayEnvironment(process.env)).filter(([name]) => name.toUpperCase() !== "OPENCODE_BROWSER_RESTART_REQUEST_ID"),
+      )
       const childEnv = { ...env, OPENCODE_BROWSER_MANAGED_RELAY: "1", ...(options.restartRequestId ? { OPENCODE_BROWSER_RESTART_REQUEST_ID: options.restartRequestId } : {}) }
       if (process.platform === "win32") {
-        // A detached spawn can still inherit extra pipe handles from cmd / PowerShell 5.1. ShellExecute starts a
-        // separate hidden console without those handles. Start-Process takes one Windows command line, not argv.
-        const args = launch.args.map(s => `"${s.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`).join(" ")
+        // Under Bun, kernel32 CreateProcessW starts the relay in its own invisible console without inheriting this
+        // process's handles (windows-launch.ts). Otherwise, and when that fails: a detached spawn can still inherit
+        // extra pipe handles from cmd / PowerShell 5.1, so ShellExecute starts a separate hidden console without them.
+        // Start-Process takes one Windows command line, not argv.
+        if (launchWindowsRelay(launch, childEnv, (reason) => relayLog("relay.launch.fallback", { executable: launch.executable, reason }))) return
+        const args = launch.args.map(quoteWindowsArgument).join(" ")
         execFileSync(path.join(process.env.SystemRoot!, "System32/WindowsPowerShell/v1.0/powershell.exe"),
           ["-NoProfile", "-NonInteractive", "-Command", "Start-Process -ErrorAction Stop -WindowStyle Hidden -FilePath $env:BROWSE_EXE -ArgumentList $env:BROWSE_ARGS"],
           { env: { ...childEnv, BROWSE_EXE: launch.executable, BROWSE_ARGS: args }, windowsHide: true, stdio: "ignore" })
@@ -367,10 +455,13 @@ export function startManagedRelay(
 }
 
 // The relay runs agent code and child commands; it gets only what it needs to run, never the MCP client's API keys.
+// Every XDG variable paths.ts reads must be here, or the relay resolves its files under a different root than the CLI
+// that started it (a pairing code written under a custom state root would never reach the relay).
 const relayEnvironmentNames = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP", "LANG", "LANGUAGE", "TZ",
-  "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DISPLAY", "WAYLAND_DISPLAY",
-  // Networking for secrets_run children (and the relay's own requests): proxies and extra CA certificates. Names
+  "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_BIN_HOME", "XDG_RUNTIME_DIR",
+  "DISPLAY", "WAYLAND_DISPLAY",
+  // Networking for child processes (and the relay's own requests): proxies and extra CA certificates. Names
   // are compared uppercased, so http_proxy and friends pass too.
   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
   // Windows: process creation, the profile and data directories, and PATH resolution.
@@ -418,4 +509,36 @@ function isRelayStarting(error: unknown): error is RelayClient.RelayRejected {
 
 function isRelayStartingOrUnreachable(error: unknown): error is RelayClient.RelayRejected | RelayClient.RelayUnreachable {
   return isRelayStarting(error) || isRelayUnreachable(error)
+}
+
+/** The instance relay.json names for this install while its process is alive. */
+function liveRelayInstanceId(): string | undefined {
+  const state = readRelayState()
+  return state !== undefined && state.configuredPort === configuredRelayPort() && processAlive(state.pid)
+    ? state.instanceId
+    : undefined
+}
+
+/** Whether relay.json names this install's live relay, a specific instance when given. */
+function relayRecorded(instanceId?: string): boolean {
+  const live = liveRelayInstanceId()
+  return live !== undefined && (instanceId === undefined || live === instanceId)
+}
+
+/**
+ * A /version that failed while relay.json still names a live relay: that relay is starting or draining, not a foreign
+ * program, and a pinned port must wait for it rather than refuse.
+ */
+function relayDraining(error: unknown): boolean {
+  return error instanceof RelayClient.RelayDecodeFailed && relayRecorded()
+}
+
+/**
+ * The port answered like another program. Without a pinned port the relay may start, or move, to a fallback port; a
+ * pinned one keeps its hard error. A timeout is not foreign: a slow relay is still this install's relay, and starting
+ * a second one elsewhere would split state (relay/port.ts).
+ */
+function isForeignListener(error: unknown, pinned?: boolean): boolean {
+  if (pinned ?? relayPortPinned()) return false
+  return error instanceof RelayClient.RelayDecodeFailed
 }

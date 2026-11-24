@@ -1,6 +1,5 @@
 import http from "node:http"
 import { Effect } from "effect"
-import * as AuthProfile from "../auth/profile.ts"
 import { selectTarget } from "../execute.ts"
 import {
   HttpRouteError,
@@ -11,9 +10,6 @@ import {
 } from "../relay/helpers.ts"
 import {
   AuthenticatedJsonRequest,
-  AuthProfileRequest,
-  AuthRefreshRequest,
-  AuthRunRequest,
   ExecuteRequest,
   NetworkSessionRequest,
   NetworkStartRequest,
@@ -76,40 +72,12 @@ export function handleNetworkRequest(options: {
     }
     if (options.pathname === "/network/stop" && options.request.method === "POST") {
       const request = yield* decodeRequest(NetworkStopRequest, yield* readJsonBody(options.request), "network stop")
-      const { sessionId, ...stopOptions } = request
-      sendJson(options.response, yield* options.sessions.networkStop(sessionId, stopOptions))
+      sendJson(options.response, yield* options.sessions.networkStop(request.sessionId))
       return
     }
     if (options.pathname === "/network/cancel" && options.request.method === "POST") {
       const request = yield* decodeRequest(NetworkSessionRequest, yield* readJsonBody(options.request), "network cancel")
       sendJson(options.response, yield* options.sessions.networkCancel(request.sessionId))
-      return
-    }
-    sendNotFound(options.response)
-  })
-}
-
-export function handleAuthRequest(options: {
-  readonly request: http.IncomingMessage
-  readonly response: http.ServerResponse
-  readonly pathname: string
-  readonly sessions: OpenCodeBrowserSessions
-}): Effect.Effect<void, Error> {
-  return Effect.gen(function* () {
-    if (options.pathname === "/auth/status" && options.request.method === "POST") {
-      const request = yield* decodeRequest(AuthProfileRequest, yield* readJsonBody(options.request), "auth status")
-      sendJson(options.response, yield* AuthProfile.status(request.name))
-      return
-    }
-    if (options.pathname === "/auth/refresh" && options.request.method === "POST") {
-      const request = yield* decodeRequest(AuthRefreshRequest, yield* readJsonBody(options.request), "auth refresh")
-      const { sessionId, ...refreshOptions } = request
-      sendJson(options.response, yield* options.sessions.authRefresh(sessionId, refreshOptions))
-      return
-    }
-    if (options.pathname === "/auth/run" && options.request.method === "POST") {
-      const request = yield* decodeRequest(AuthRunRequest, yield* readJsonBody(options.request), "auth run")
-      sendJson(options.response, yield* AuthProfile.run(request))
       return
     }
     sendNotFound(options.response)
@@ -135,6 +103,7 @@ export function handleCliRequest(options: {
       const session = yield* options.sessions.create(optionalSessionId(request.id), {
         readOnly: request.readOnly === true,
         ...(allowedOrigins ? { allowedOrigins } : {}),
+        ...(request.keepVisible === true ? { keepVisible: true } : {}),
         ...(request.browser ? { browser: request.browser } : {}),
       })
       noteClient(options.request, options.sessions, session.id)

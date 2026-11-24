@@ -38,7 +38,6 @@ describe("guardCdpMethod", () => {
   test("lets ordinary and custom relay methods through", () => {
     expect(guardCdpMethod({ method: "Page.navigate", readOnly: false })).toBeNull()
     expect(guardCdpMethod({ method: "Runtime.evaluate", readOnly: false })).toBeNull()
-    expect(guardCdpMethod({ method: "OpenCodeBrowser.ghostCursor", readOnly: false })).toBeNull()
   })
 
   test("read-only sessions can take snapshots and screenshots", () => {
@@ -87,6 +86,14 @@ describe("guardCdpMethod", () => {
     // Turning on request interception or spawning/attaching to a new target is not a read.
     for (const method of ["Fetch.enable", "Debugger.enable", "Cast.enable", "Overlay.enable"]) {
       expect(guardCdpMethod({ method, readOnly: true, sessionId: "look" })).toContain("this tab is read-only")
+    }
+  })
+
+  test("read-only sessions may only turn file chooser interception off", () => {
+    const guard = (params: Record<string, unknown>) => guardCdpMethod({ method: "Page.setInterceptFileChooserDialog", readOnly: true, sessionId: "look", params })
+    expect(guard({ enabled: false })).toBeNull()
+    for (const params of [{ enabled: true }, { enabled: "false" }, {}, { enabled: false, cancel: true }]) {
+      expect(guard(params)).toContain("this tab is read-only")
     }
   })
 

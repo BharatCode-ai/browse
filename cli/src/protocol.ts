@@ -6,6 +6,8 @@ export type JsonObject = { readonly [key: string]: JsonValue }
 
 /** Used by the extension worker, the relay handshake and the public /version probe. */
 export const extensionProtocolVersion = 3
+/** The extension can keep a released agent tab open and tracked for idle cleanup (`debugger.detach` release). */
+export const extensionCapabilityTabRelease = "tab-release"
 /**
  * The oldest extension protocol this relay still speaks. The store extension and the npm package update on their own
  * schedules, so a relay keeps accepting older extensions for a while: raise this only when dropping support for them,
@@ -14,7 +16,8 @@ export const extensionProtocolVersion = 3
 export const minExtensionProtocolVersion = 3
 
 export const unpackedExtensionId = "faccoaejfgiiagkhdlhikildfefmjigf"
-export const browserUnresponsive = "The browser isn't responding (asleep or frozen?). Wake it and try again."
+export const browserUnresponsive = "The browser isn't answering (asleep, frozen or very busy?). Wake it or wait a moment, then try again."
+export const browserReloading = "browse stopped answering in this browser for over a minute, so the relay asked it to reload. Try again in a few seconds." 
 export const unpackedReloadAdvice = "Reload browse on your browser's extensions page (↻)."
 // A close reason, not an RPC. Older workers just see extension-older; newer workers verify the build locally.
 export const checkoutReloadPrefix = "Extension protocol incompatible: extension-older; reload "
@@ -140,10 +143,6 @@ const extensionCommandMethodValues = [
   "pageStatus.set",
   "pageStatus.clear",
   "runtime.reload",
-  "recording.start",
-  "recording.stop",
-  "recording.status",
-  "recording.cancel",
   "tabs.cleanup",
   "update.notice",
   "relay.settings",
@@ -166,7 +165,6 @@ const extensionEventMethodValues = [
   "tabs.opened",
   "pong",
   "log",
-  "recording.cancelled",
   "pageStatus.requested",
   "settings",
 ] as const

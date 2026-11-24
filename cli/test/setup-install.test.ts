@@ -5,7 +5,7 @@ import path from "node:path"
 import { parse } from "jsonc-parser"
 import { agentLocations, agentNames, callingAgent, editAgentConfig } from "../src/setup/agent-config.ts"
 import { agentFlags, agentPlan } from "../src/setup/agent-picker.ts"
-const STORE_URL = "https://chromewebstore.google.com/detail/abcdefghijklmnopabcdefghijklmnop"
+import { home as userHome, manualPair, STORE_URL } from "../src/setup/environment.ts"
 import { configureMcp, installedExtensionVersion, installedRuntime, installWaitTimeout, locateExtension, manualMcpEntry, pairStoreExtension, relayNotRestarted, remoteRelayAddresses, remoteRelayLines, removeMcp, waitForExtension, type Browser, type Detection, type LocateOptions } from "../src/setup.ts"
 
 const browser = (name: string): Browser => ({ name, userData: `/data/${name}`, manifests: [], defaultIDs: [], executables: [] })
@@ -13,6 +13,11 @@ const chrome = browser("Google Chrome")
 const edge = browser("Microsoft Edge")
 const none = (target: Browser): Detection => ({ browser: target, blocked: false, enabled: [], disabled: [] })
 const folder = "/src/browse/dist"
+
+test("a remote relay's pairing text names its address instead of localhost", () => {
+  expect(manualPair("ABCD1234", 19990, "devbox.tail1234.ts.net:19990")).toContain("devbox.tail1234.ts.net:19990")
+  expect(manualPair("ABCD1234", 19990)).toContain("localhost:19990")
+})
 
 test("identifies the calling agent, not the editor hosting a regular terminal", () => {
   expect(callingAgent({ CLAUDECODE: "1", TERM_PROGRAM: "vscode" })).toBe("claude")
@@ -24,6 +29,8 @@ test("identifies the calling agent, not the editor hosting a regular terminal", 
   expect(callingAgent({ TERM_PROGRAM: "vscode", CODEX_HOME: "/home/me/.codex" })).toBeUndefined()
   expect(callingAgent({ GEMINI_CLI: "1" })).toBe("gemini")
   expect(callingAgent({ OPENCODE_SESSION_ID: "session" })).toBe("opencode")
+  expect(callingAgent({ PI_SESSION_ID: "session" })).toBe("pi")
+  expect(callingAgent({ AI_AGENT: "pi" })).toBe("pi")
   expect(callingAgent({ AMP_CURRENT_THREAD_ID: "thread" })).toBe("amp")
   expect(callingAgent({ AI_AGENT: "goose@1.2.3" })).toBe("goose")
 })
@@ -36,7 +43,7 @@ test("OpenCode JSONC keeps comments and other servers across install, reinstall 
     fs.writeFileSync(file, before)
     expect(configureMcp(file, entry)).toContain("added")
     const once = fs.readFileSync(file, "utf8")
-    expect(parse(once).mcp.servers.browse).toMatchObject({ type: "local", command: ["node", entry, "mcp"] })
+    expect(parse(once).mcp.servers.browse).toMatchObject({ type: "local", command: ["node", entry, "mcp"], cwd: userHome, pool: true })
     expect(configureMcp(file, entry, entry)).toContain("up to date")
     expect(fs.readFileSync(file, "utf8")).toBe(once)
     expect(removeMcp("browse", entry, file)).toBe(true)
@@ -46,13 +53,64 @@ test("OpenCode JSONC keeps comments and other servers across install, reinstall 
   } finally { fs.rmSync(home, { recursive: true, force: true }) }
 })
 
+test("OpenCode's cwd is the absolute home directory: older OpenCode versions don't expand ~", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "browse-opencode-cwd-"))
+  try {
+    const file = path.join(dir, "opencode.json")
+    // An earlier install wrote `~`, which older OpenCode versions don't expand (it fails on Windows), so the server
+    // failed to start. Everything else matches what install would write, so cwd is the only difference.
+    fs.writeFileSync(file, JSON.stringify({ mcp: { servers: { browse: {
+      type: "local",
+      command: ["browse", "mcp"],
+      cwd: "~",
+      pool: true,
+      environment: { OPENCODE_BROWSER_RUNTIME: "auto-update" },
+    } } } }))
+    expect(configureMcp(file, "browse", "browse")).toContain("updated")
+    const cwd = parse(fs.readFileSync(file, "utf8")).mcp.servers.browse.cwd
+    expect(path.isAbsolute(cwd)).toBe(true)
+    expect(cwd).toBe(userHome)
+    expect(cwd).not.toBe("~")
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("OpenCode shares one browse server: browse's older entries gain pool and a fixed cwd, user entries stay", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "browse-openpool-"))
+  try {
+    const file = path.join(home, "opencode.json")
+    // An earlier browse install wrote this entry without pool or cwd.
+    fs.writeFileSync(file, JSON.stringify({
+      mcp: {
+        servers: {
+          browse: { type: "local", command: ["browse", "mcp"], environment: { OPENCODE_BROWSER_RUNTIME: "auto-update", KEEP: "1" } },
+          other: { type: "local", command: ["my-server"] },
+        },
+      },
+    }, null, 2))
+    expect(configureMcp(file, "browse", "browse")).toContain("updated")
+    const config = parse(fs.readFileSync(file, "utf8"))
+    expect(config.mcp.servers.browse).toEqual({
+      type: "local",
+      command: ["browse", "mcp"],
+      cwd: userHome,
+      pool: true,
+      environment: { OPENCODE_BROWSER_RUNTIME: "auto-update", KEEP: "1" },
+    })
+    expect(config.mcp.servers.other).toEqual({ type: "local", command: ["my-server"] })
+    // A server named browse with a command browse didn't write is the user's; leave it alone.
+    fs.writeFileSync(file, JSON.stringify({ mcp: { servers: { browse: { type: "local", command: ["someone-else", "mcp"] } } } }))
+    expect(configureMcp(file, "browse", "browse")).toBeUndefined()
+    expect(parse(fs.readFileSync(file, "utf8")).mcp.servers.browse).toEqual({ type: "local", command: ["someone-else", "mcp"] })
+  } finally { fs.rmSync(home, { recursive: true, force: true }) }
+})
+
 test("a binary install's entry runs the executable itself, in OpenCode, other agents and the manual entry", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "browse-binary-"))
   try {
     const binary = path.join(home, ".local", "bin", "browse")
     const opencode = path.join(home, "opencode.json")
     expect(configureMcp(opencode, binary)).toContain("added")
-    expect(parse(fs.readFileSync(opencode, "utf8")).mcp.servers.browse).toMatchObject({ command: [binary, "mcp"], environment: { OPENCODE_BROWSER_RUNTIME: "auto-update" } })
+    expect(parse(fs.readFileSync(opencode, "utf8")).mcp.servers.browse).toMatchObject({ command: [binary, "mcp"], cwd: userHome, pool: true, environment: { OPENCODE_BROWSER_RUNTIME: "auto-update" } })
     expect(configureMcp(opencode, binary, binary)).toContain("up to date")
     expect(removeMcp("browse", binary, opencode)).toBe(true)
 
@@ -130,6 +188,24 @@ test.each(agentNames.filter(n => n !== "opencode"))("%s user config: preserve un
   } finally { fs.rmSync(home, { recursive: true, force: true }) }
 })
 
+test.each(["hermes", "goose"] as const)("%s keeps large integers and long scalars byte-for-byte when install adds its entry", name => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "browse-yaml-"))
+  try {
+    const key = name === "goose" ? "extensions" : "mcp_servers"
+    const file = path.join(home, "config.yaml")
+    const long = "a single quoted value that is deliberately longer than the eighty column line width yaml would fold at"
+    // The browse entry is appended to the last map, so every byte before it must come back unchanged.
+    const before = `# my config\naccount: 1234567890123456789\nnote: '${long}'\n${key}:\n  other: { url: https://other }\n`
+    fs.writeFileSync(file, before)
+    expect(editAgentConfig({ name, file, node: "/a path/node", entry: "/a path/browse.mjs" })).toBe("added")
+    const after = fs.readFileSync(file, "utf8")
+    expect(after.startsWith(before)).toBe(true)
+    expect(after).toContain("account: 1234567890123456789")
+    expect(after).toContain(`note: '${long}'`)
+    expect((Bun.YAML.parse(after) as Record<string, { browse?: unknown }>)[key]?.browse).toMatchObject(name === "goose" ? { cmd: "/a path/node", args: ["/a path/browse.mjs", "mcp"] } : { command: "/a path/node", args: ["/a path/browse.mjs", "mcp"] })
+  } finally { fs.rmSync(home, { recursive: true, force: true }) }
+})
+
 test("an agent config write is atomic and keeps the file's mode", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "browse-atomic-"))
   try {
@@ -148,16 +224,38 @@ test("every picker choice has one user-scoped destination; config dirs and binar
   try {
     const config = path.join(home, ".config")
     fs.mkdirSync(path.join(home, ".qwen"))
+    fs.mkdirSync(path.join(home, ".pi/agent"), { recursive: true })
+    fs.mkdirSync(path.join(home, ".workbuddy"))
     const locations = agentLocations(home, config, bin => bin === "droid", path.join(config, "opencode/opencode.json"))
     expect(locations.map(a => a.name).sort()).toEqual([...agentNames].sort())
     expect(locations.find(a => a.name === "qwen-code")).toMatchObject({ installed: true, file: path.join(home, ".qwen/settings.json") })
     expect(locations.find(a => a.name === "droid")).toMatchObject({ installed: true, file: path.join(home, ".factory/mcp.json") })
+    expect(locations.find(a => a.name === "pi")).toMatchObject({ installed: true, file: path.join(home, ".pi/agent/mcp.json") })
     expect(locations.find(a => a.name === "junie")?.installed).toBe(false)
+    // WorkBuddy keeps its config in its home folder everywhere; Trae CN in the application support folder.
+    expect(locations.find(a => a.name === "workbuddy")).toMatchObject({ installed: true, file: path.join(home, ".workbuddy/mcp.json") })
+    const support = process.platform === "darwin" ? path.join(home, "Library/Application Support") : process.platform === "win32" ? process.env.APPDATA ?? path.join(home, "AppData/Roaming") : config
+    // Whether Trae CN looks installed depends on the host (an /Applications bundle, %APPDATA% on Windows), so only check where it writes.
+    expect(locations.find(a => a.name === "trae-cn")?.file).toBe(path.join(support, "Trae CN/User/mcp.json"))
+  } finally { fs.rmSync(home, { recursive: true, force: true }) }
+})
+
+test.each(["workbuddy", "trae-cn"] as const)("%s keeps another server's disabled field across install and uninstall", name => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "browse-disabled-"))
+  try {
+    const file = path.join(home, "mcp.json")
+    const before = { mcpServers: { other: { command: "x", disabled: true } } }
+    fs.writeFileSync(file, JSON.stringify(before))
+    const receipt = { name, file, node: "/a path/node", entry: "/a path/browse.mjs" }
+    expect(editAgentConfig(receipt)).toBe("added")
+    expect(parse(fs.readFileSync(file, "utf8")).mcpServers.other).toEqual(before.mcpServers.other)
+    expect(editAgentConfig(receipt, true)).toBe("removed")
+    expect(parse(fs.readFileSync(file, "utf8"))).toEqual(before)
   } finally { fs.rmSync(home, { recursive: true, force: true }) }
 })
 
 /** Runs locateExtension with recording effects: nothing real is opened, revealed or copied. */
-function run(overrides: Partial<LocateOptions> = {}, results: { open?: boolean } = {}, withStore = true) {
+function run(overrides: Partial<LocateOptions> = {}, results: { open?: boolean } = {}) {
   const calls: { open: [string, string][]; reveal: string[]; copy: string[] } = { open: [], reveal: [], copy: [] }
   const lines: string[] = []
   const options: LocateOptions = {
@@ -166,7 +264,6 @@ function run(overrides: Partial<LocateOptions> = {}, results: { open?: boolean }
     detections: [none(chrome)],
     preferred: chrome,
     env: { ssh: false, display: true, tty: true, platform: "darwin" },
-    ...(withStore ? { storeUrl: STORE_URL } : {}),
     ...overrides,
   }
   const outcome = locateExtension(options, {
@@ -246,7 +343,7 @@ describe("install with the extension", () => {
   })
 
   test("an installed extension is ready even before the relay runs", () => {
-    const match = { browser: chrome, profile: { dir: "Default", name: "Person 1" }, id: "faccoaejfgiiagkhdlhikildfefmjigf" }
+    const match = { browser: chrome, profile: { dir: "Default", name: "Person 1" }, id: "afeafocngkodbmaipcngoamamfmekgfo" }
     const { outcome, output } = run({ detections: [{ ...none(chrome), enabled: [match] }] })
     expect(outcome).toBe("ready")
     expect(output).toBe("")
@@ -261,7 +358,7 @@ describe("install with the extension", () => {
   })
 
   test("a turned-off extension is reported, not reinstalled", () => {
-    const match = { browser: chrome, profile: { dir: "Default", name: "Person 1" }, id: "faccoaejfgiiagkhdlhikildfefmjigf" }
+    const match = { browser: chrome, profile: { dir: "Default", name: "Person 1" }, id: "afeafocngkodbmaipcngoamamfmekgfo" }
     const { outcome, calls, output } = run({ detections: [{ ...none(chrome), disabled: [match] }] })
     expect(outcome).toBe("off")
     expect(calls.open).toEqual([])
@@ -292,10 +389,10 @@ describe("the store item", () => {
     expect(output).not.toContain("unpacked")
   })
 
-  test("a checkout without a configured store item uses unpacked guidance", () => {
-    const { output } = run({}, {}, false)
-    expect(output).toContain("Load the BharatCode Browse extension")
-    expect(output).not.toContain("chromewebstore.google.com")
+  test("a checkout, with no store item baked in, points at browse's public item", () => {
+    const { output } = run()
+    expect(output).toContain("https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg")
+    expect(output).not.toContain("unpacked")
   })
 })
 
@@ -326,7 +423,7 @@ describe("pairing the store build", () => {
   })
 
   test("never hands the code to an extension that isn't a configured store item", () => {
-    const { outcome, opened } = pair([{ ...none(chrome), enabled: [{ browser: chrome, profile, id: "faccoaejfgiiagkhdlhikildfefmjigf" }] }])
+    const { outcome, opened } = pair([{ ...none(chrome), enabled: [{ browser: chrome, profile, id: "afeafocngkodbmaipcngoamamfmekgfo" }] }])
     expect(outcome).toBe("none")
     expect(opened).toEqual([])
   })
@@ -343,7 +440,8 @@ describe("pairing the store build", () => {
     const { outcome, opened, output } = pair([{ ...none(chrome), enabled: [{ browser: chrome, profile, id: storeId }] }], { allowOpen: false })
     expect(outcome).toBe("manual")
     expect(opened).toEqual([])
-    expect(output).toContain("click Pair.")
+    expect(output).toContain("expand advanced (or click Pair with a code)")
+    expect(output).toContain("click Connect.")
   })
 })
 
@@ -425,7 +523,7 @@ test("install --remote prefers the tailnet's addresses, else the LAN's, and prin
   const address = (value: string, internal = false) => ({ address: value, family: "IPv4" as const, internal, netmask: "255.255.255.0", mac: "00:00:00:00:00:00", cidr: null })
   const lan = { lo: [address("127.0.0.1", true)], eth0: [address("192.168.1.20")], docker0: [address("172.17.0.1")], wlan0: [address("169.254.3.4"), address("10.0.0.5")] }
   expect(remoteRelayAddresses(lan)).toEqual(["192.168.1.20", "10.0.0.5"])
-  expect(remoteRelayAddresses(lan, { port: 19989 })).toEqual(["192.168.1.20", "10.0.0.5"])
+  expect(remoteRelayAddresses(lan, { port: 19988 })).toEqual(["192.168.1.20", "10.0.0.5"])
   expect(remoteRelayAddresses(lan, { port: 20001 })).toEqual(["192.168.1.20:20001", "10.0.0.5:20001"])
   const tailnet = { ...lan, tailscale0: [address("100.101.102.103")] }
   expect(remoteRelayAddresses(tailnet)).toEqual(["100.101.102.103"])

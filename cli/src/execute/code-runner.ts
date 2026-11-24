@@ -7,18 +7,11 @@ import type { Browser, BrowserContext, ConsoleMessage, Frame, Locator, Page } fr
 import { classifyChallenge, probePageScript, probeSelectors, type ChallengeOutcome, type ChallengeProbe } from "./challenge-detection.ts"
 import type { DemonstrationResult } from "./demonstration.ts"
 import { pageVisibleApiWarningForName, sandboxModules, type ExecuteFiles, type ExecuteRealm } from "../execute-realm.ts"
-import type {
-  GhostCursorCalloutOptions,
-  GhostCursorCaptionOptions,
-  GhostCursorClientOptions,
-  GhostCursorSpotlightOptions,
-  GhostCursorZoomOptions,
-} from "../ghost-cursor.ts"
+import { ExecuteRejectionScope } from "./rejection-scope.ts"
 import type * as NetworkCapture from "../network-capture.ts"
 import { PageConsole } from "./console.ts"
 import type { ExecuteAftermath, ExecuteLogEntry, ExecuteLogSummary } from "../relay/schema.ts"
 import type { ScreenshotDiffOptions, ScreenshotDiffResult } from "../snapshot/screenshot-diff.ts"
-import type * as SiteSecrets from "../auth/site-secrets.ts"
 import type {
   AriaSnapshotHelper,
   InputField,
@@ -36,27 +29,10 @@ import { safePageUrl } from "./target-selection.ts"
 // Full Node modules, only with OPENCODE_BROWSER_ALLOW_NODE=1. Sandboxed execute code gets sandboxModules.
 export const nodeModules = { ...sandboxModules, fs, os, http, https }
 
-export type TypeSecretOptions = {
-  /** Clear the field first (default true). */
-  readonly clear?: boolean
-  /** How long to wait for the target element, in milliseconds (default 10000). */
-  readonly timeout?: number
-}
-
-export type TypeSecretResult = { readonly typed: true; readonly name: string; readonly origin: string; readonly kind: SiteSecrets.SiteSecretKind }
-
 export type HandoffCallOptions = {
   readonly timeoutMs?: number
   readonly page?: Page
   readonly start?: () => unknown | Promise<unknown>
-}
-
-export type ShowGhostCursorOptions = GhostCursorClientOptions & {
-  readonly page?: Page
-}
-
-export type HideGhostCursorOptions = {
-  readonly page?: Page
 }
 
 export type SandboxGlobals = {
@@ -74,35 +50,17 @@ export type SandboxGlobals = {
   readonly snapshot: SnapshotHelper
   readonly ref: SnapshotRefHelper
   readonly webmcp: WebMcpHelper
-  readonly showGhostCursor: (options?: ShowGhostCursorOptions) => Promise<void>
-  readonly hideGhostCursor: (options?: HideGhostCursorOptions) => Promise<void>
-  readonly ghostCursor: {
-    readonly show: (options?: ShowGhostCursorOptions) => Promise<void>
-    readonly hide: (options?: HideGhostCursorOptions) => Promise<void>
-    readonly caption: (title: string | null, options?: GhostCursorCaptionOptions & { readonly page?: Page }) => Promise<void>
-    readonly clearCaption: (options?: { readonly page?: Page }) => Promise<void>
-    readonly callout: (target: Locator | string, label: string, options?: GhostCursorCalloutOptions & { readonly page?: Page }) => Promise<void>
-    readonly clearCallouts: (options?: { readonly page?: Page }) => Promise<void>
-    readonly zoom: (target: Locator | string | { readonly x: number; readonly y: number } | null, options?: GhostCursorZoomOptions & { readonly page?: Page }) => Promise<void>
-    readonly resetZoom: (options?: { readonly durationMs?: number; readonly page?: Page }) => Promise<void>
-    readonly spotlight: (target: Locator | string | null, options?: GhostCursorSpotlightOptions & { readonly page?: Page }) => Promise<void>
-    readonly clearSpotlight: (options?: { readonly page?: Page }) => Promise<void>
-    readonly keys: (keys: string | readonly string[], label?: string, options?: { readonly page?: Page }) => Promise<void>
-  }
-  readonly handoff: (message?: string, options?: HandoffCallOptions) => Promise<void>
   readonly demonstrate: (message?: string, options?: HandoffCallOptions) => Promise<DemonstrationResult>
+  readonly handoff: (message?: string, options?: HandoffCallOptions) => Promise<void>
   readonly network: {
     readonly start: (options?: NetworkCapture.NetworkCaptureOptions) => Promise<NetworkCapture.NetworkCaptureStatus>
     readonly status: () => NetworkCapture.NetworkCaptureStatus
-    readonly stop: (options?: NetworkCapture.NetworkCaptureStopOptions) => Promise<NetworkCapture.NetworkCaptureResult>
+    readonly stop: () => Promise<NetworkCapture.NetworkCaptureResult>
     readonly cancel: () => Promise<{ readonly cancelled: boolean }>
   }
   readonly pageConsole: {
     readonly start: (page?: Page) => Promise<{ readonly capturing: boolean }>
     readonly stop: (page?: Page) => Promise<{ readonly capturing: boolean }>
-  }
-  readonly secrets: {
-    readonly type: (target: Locator | string, name: string, options?: TypeSecretOptions) => Promise<TypeSecretResult>
   }
   readonly handoffTracker: { count: number }
 }
@@ -215,17 +173,18 @@ const sandboxGlobalKeys = [
   "snapshot",
   "ref",
   "webmcp",
-  "showGhostCursor",
-  "hideGhostCursor",
-  "ghostCursor",
   "handoff",
   "demonstrate",
   "network",
   "pageConsole",
-  "secrets",
 ] as const satisfies readonly (keyof Omit<SandboxGlobals, "handoffTracker">)[]
 
-export async function runUserCode({ code, globals, realm }: { readonly code: string; readonly globals: SandboxGlobals; readonly realm?: ExecuteRealm }): Promise<{
+export async function runUserCode({ code, globals, realm, onUnhandledRejection }: {
+  readonly code: string
+  readonly globals: SandboxGlobals
+  readonly realm?: ExecuteRealm
+  readonly onUnhandledRejection?: (warning: string) => void
+}): Promise<{
   readonly result: unknown
   readonly logs: readonly ExecuteLogEntry[]
   readonly logSummary: ExecuteLogSummary
@@ -289,8 +248,18 @@ export async function runUserCode({ code, globals, realm }: { readonly code: str
     }
     const AsyncFunction = async function () {}.constructor as new (...args: string[]) => (...args: unknown[]) => Promise<unknown>
     const fn = new AsyncFunction("console", ...sandboxGlobalKeys, `${wrapCodeWithModuleAliases(code, Object.keys(nodeModules))}\n//# sourceURL=${executeFilename}`)
-    const result = await fn(...values)
-    return { result, ...buildResultMetadata() }
+    // Full Node execute code has no realm to tag its promises. Node's promise hook tags the synchronous call and
+    // continuations inherit it; Bun has no hook, so the process guard's generic fallback contains those rejections.
+    const scope = process.versions.bun || !onUnhandledRejection
+      ? undefined
+      : new ExecuteRejectionScope({ onRejection: onUnhandledRejection })
+    scope?.begin()
+    try {
+      const result = await (scope ? scope.invoke(() => fn(...values)) : fn(...values))
+      return { result, ...buildResultMetadata() }
+    } finally {
+      scope?.end()
+    }
   } catch (cause) {
     const error = cause instanceof Error ? cause : new Error("execute sandbox code", { cause })
     const metadata = buildResultMetadata()

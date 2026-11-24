@@ -1,10 +1,10 @@
-import { Effect } from "effect"
+import { Effect, Fiber } from "effect"
 import type { Browser, BrowserContext, Page } from "patchright-core"
 import { registerAriaSnapshotSelector } from "./snapshot/aria-snapshot.ts"
-import * as AuthProfile from "./auth/profile.ts"
+import { registerRefSelector } from "./snapshot/ref-selector.ts"
 import * as AuthenticatedOrigin from "./auth/authenticated-origin.ts"
 import { challengeWarning } from "./execute/challenge-detection.ts"
-import { executeAllowsNode, ExecuteRealm, pageVisibleApiWarning } from "./execute-realm.ts"
+import { executeAllowsNode, ExecuteRealm, pageVisibleApiWarning, type ExecuteCpuScheduler } from "./execute-realm.ts"
 import {
   challengeWaitMs,
   detectChallenge,
@@ -17,7 +17,7 @@ import {
   type SandboxGlobals,
 } from "./execute/code-runner.ts"
 import { DefaultPageHost } from "./execute/default-page.ts"
-import { downloadCapabilityErrorMessage, installDownloadCapabilityGuard, installDownloadCapabilityGuards, installViewportZoomGuard } from "./execute/guards.ts"
+import { downloadCapabilityErrorMessage, installDownloadCapabilityGuard, installDownloadCapabilityGuards, installViewportZoomGuard, withRestoredViewports } from "./execute/guards.ts"
 import {
   createExecuteLogCapture,
   emptyExecuteLogSummary,
@@ -28,11 +28,14 @@ import {
 } from "./execute/log-capture.ts"
 import {
   adoptedPageConnectTimeoutMs,
+  defaultActionTimeoutMs,
   defaultHandoffTimeoutMs,
   defaultPageClosedWarning,
   defaultPageReattachedWarning,
   defaultPageRepairedWarning,
   defaultPageReplacedWarning,
+  debuggingBarDismissedStop,
+  debuggingBarDismissedWarning,
   finishHandoff,
   handoffPageContextTimeoutMs,
   isDisposableSessionPage,
@@ -72,7 +75,6 @@ import {
   toJsonSafeValue,
 } from "./execute/result-formatting.ts"
 import { buildSandboxGlobals } from "./execute/sandbox-globals.ts"
-import { ExecuteSecretsBridge } from "./execute/secrets-bridge.ts"
 import * as NetworkCapture from "./network-capture.ts"
 import { installPageReadTimeout } from "./execute/read-timeout.ts"
 import { tunePatchright } from "./execute/patchright-tuning.ts"
@@ -106,6 +108,8 @@ export {
   defaultPageReattachedWarning,
   defaultPageRepairedWarning,
   defaultPageReplacedWarning,
+  debuggingBarDismissedStop,
+  debuggingBarDismissedWarning,
   detectChallenge,
   downloadCapabilityErrorMessage,
   extractExecuteMedia,
@@ -153,10 +157,10 @@ type ExecuteSandboxOptions = {
   readonly pageHealthCheckTimeoutMs?: number
   /** Whether the page with this target id is being recorded; helpers then draw nothing into it. */
   readonly isRecordingTarget?: (targetId: string) => boolean
-  /** The session's domain allowlist patterns (domain-policy.ts), or undefined when it has none. */
-  readonly allowedOrigins?: () => readonly string[] | undefined
   /** Allowlist violations the relay saw in this session's tabs since the last execute. */
   readonly drainGuardWarnings?: () => readonly string[]
+  /** Shares the relay's event loop fairly with other sessions' execute code. */
+  readonly cpuScheduler?: ExecuteCpuScheduler
 }
 
 export type ExecuteResult = {
@@ -174,6 +178,8 @@ export type ExecuteResult = {
 
 export type ExecuteOptions = {
   readonly targetSelection?: ExecuteTargetSelection
+  /** Playwright's action budget for this call, when the caller or the relay chose an overall timeout. */
+  readonly actionTimeoutMs?: number
 }
 
 export class ExecuteSandbox extends DefaultPageHost {
@@ -182,7 +188,9 @@ export class ExecuteSandbox extends DefaultPageHost {
   private readonly allowNode = executeAllowsNode()
   private readonly snapshotRefs: SnapshotRefRegistry = { selectors: new Map() }
   private readonly networkCapture = new NetworkCapture.Recorder()
-  private readonly secrets: ExecuteSecretsBridge
+  private readonly viewportGuardContexts = new WeakSet<BrowserContext>()
+  /** The context whose pages this call gave its action budget, for the restore. */
+  private actionTimeoutContext: BrowserContext | undefined
   private realm: ExecuteRealm | undefined
   private state: Record<string, unknown>
 
@@ -190,11 +198,6 @@ export class ExecuteSandbox extends DefaultPageHost {
     super({
       ...(options.onDefaultTargetChange ? { onDefaultTargetChange: options.onDefaultTargetChange } : {}),
       ...(options.pageHealthCheckTimeoutMs === undefined ? {} : { pageHealthCheckTimeoutMs: options.pageHealthCheckTimeoutMs }),
-    })
-    this.secrets = new ExecuteSecretsBridge({
-      networkCapture: this.networkCapture,
-      allowedOrigins: () => this.options.allowedOrigins?.(),
-      addWarningOnce: (warning) => this.addWarningOnce(warning),
     })
     this.realm = this.allowNode ? undefined : this.createRealm()
     this.state = this.realm?.state ?? {}
@@ -209,44 +212,64 @@ export class ExecuteSandbox extends DefaultPageHost {
       onHostCall: (fn, receiver, args) => {
         this.addWarningOnce(pageVisibleApiWarning(fn, receiver, args))
       },
+      onUnhandledRejection: (warning) => this.addWarningOnce(warning),
+      ...(this.options.cpuScheduler ? { scheduler: this.options.cpuScheduler } : {}),
     })
   }
 
   execute(code: string, options: ExecuteOptions = {}): Effect.Effect<ExecuteResult> {
     return Effect.tryPromise({
       try: async () => {
-        if (this.realm?.isStopped) {
-          this.realm = this.createRealm()
-          this.state = this.realm.state
-          this.pendingWarnings.push("The previous execute realm stopped; JavaScript state and pending callbacks were reset.")
-        }
-        if (!this.realm) for (const warning of pageVisibleApiSourceWarnings(code)) this.addWarningOnce(warning)
-        const globals = await this.getGlobals(options)
-        const { result, logs, logSummary, aftermath } = await runUserCode({ code, globals, ...(this.realm ? { realm: this.realm } : {}) })
-          .then(async (completed) => ({ ...completed, aftermath: await this.withChallenge(globals.page, completed.aftermath, false) }))
-          .catch(async (error: unknown) => {
-            if (!(error instanceof ExecuteCodeError) || !error.aftermath) throw error
-            throw new ExecuteCodeError(error.originalError, error.logs, error.logSummary, await this.withChallenge(globals.page, error.aftermath, true))
+        this.actionTimeoutMs = options.actionTimeoutMs ?? defaultActionTimeoutMs
+        try {
+          if (this.realm?.isStopped) {
+            this.realm = this.createRealm()
+            this.state = this.realm.state
+            this.pendingWarnings.push("The previous execute realm stopped; JavaScript state and pending callbacks were reset.")
+          }
+          if (!this.realm) for (const warning of pageVisibleApiSourceWarnings(code)) this.addWarningOnce(warning)
+          const globals = await this.getGlobals(options)
+          return await withRestoredViewports({
+            context: globals.context,
+            page: globals.page,
+            run: async () => {
+              const { result, logs, logSummary, aftermath } = await runUserCode({
+                code,
+                globals,
+                ...(this.realm ? { realm: this.realm } : {}),
+                onUnhandledRejection: (warning) => this.addWarningOnce(warning),
+              })
+                .then(async (completed) => ({ ...completed, aftermath: await this.withChallenge(globals.page, completed.aftermath, false) }))
+                .catch(async (error: unknown) => {
+                  if (!(error instanceof ExecuteCodeError) || !error.aftermath) throw error
+                  throw new ExecuteCodeError(error.originalError, error.logs, error.logSummary, await this.withChallenge(globals.page, error.aftermath, true))
+                })
+              await this.networkCapture.settleForOutput()
+              const extracted = extractExecuteMedia(result)
+              const redactedValue = this.networkCapture.redactValue(extracted.value)
+              const jsonSafeResult = toJsonSafeValue(redactedValue)
+              const bounded = boundExecuteResult(stringifyResult(redactedValue), jsonSafeResult.serializable ? jsonSafeResult.value : undefined, jsonSafeResult.serializable)
+              const warnings = this.finalizeWarnings(
+                logSummary,
+                jsonValueWarning(redactedValue, jsonSafeResult),
+                bounded.warning,
+              )
+              return {
+                text: bounded.text,
+                ...(bounded.hasValue ? { value: bounded.value } : {}),
+                ...(extracted.media.length > 0 ? { media: extracted.media } : {}),
+                isError: false,
+                logs: this.networkCapture.redactCaptureLogs(logs),
+                logSummary,
+                warnings,
+                aftermath: this.networkCapture.redactCaptureAftermath(aftermath),
+              }
+            },
           })
-        await this.networkCapture.settleForOutput()
-        const extracted = extractExecuteMedia(result)
-        const redactedValue = this.secrets.redactOutputValue(extracted.value)
-        const jsonSafeResult = toJsonSafeValue(redactedValue)
-        const bounded = boundExecuteResult(stringifyResult(redactedValue), jsonSafeResult.serializable ? jsonSafeResult.value : undefined, jsonSafeResult.serializable)
-        const warnings = this.finalizeWarnings(
-          logSummary,
-          jsonValueWarning(redactedValue, jsonSafeResult),
-          bounded.warning,
-        )
-        return {
-          text: bounded.text,
-          ...(bounded.hasValue ? { value: bounded.value } : {}),
-          ...(extracted.media.length > 0 ? { media: extracted.media } : {}),
-          isError: false,
-          logs: this.secrets.redactCaptureLogs(logs),
-          logSummary,
-          warnings,
-          aftermath: this.secrets.redactCaptureAftermath(aftermath),
+        } finally {
+          this.restoreActionTimeout()
+          this.actionTimeoutContext?.setDefaultTimeout?.(defaultActionTimeoutMs)
+          this.actionTimeoutContext = undefined
         }
       },
       catch: (cause) => {
@@ -282,13 +305,13 @@ export class ExecuteSandbox extends DefaultPageHost {
               : formatLocatorFailurePageWarning(error instanceof ExecuteCodeError ? error.originalError : error, aftermath, this.recreatedFromClosedUrl),
           )
           return {
-            text: this.secrets.redactOutputText(error instanceof ExecuteCodeError ? userCodeStack(error) : error.message),
+            text: this.networkCapture.redactText(error instanceof ExecuteCodeError ? userCodeStack(error) : error.message),
             isError: true,
-            logs: this.secrets.redactCaptureLogs(error instanceof ExecuteCodeError ? error.logs : []),
+            logs: this.networkCapture.redactCaptureLogs(error instanceof ExecuteCodeError ? error.logs : []),
             logSummary,
             warnings,
-            ...(diagnostic ? { diagnostic: this.secrets.redactOutputText(diagnostic) } : {}),
-            ...(aftermath ? { aftermath: this.secrets.redactCaptureAftermath(aftermath) } : {}),
+            ...(diagnostic ? { diagnostic: this.networkCapture.redactText(diagnostic) } : {}),
+            ...(aftermath ? { aftermath: this.networkCapture.redactCaptureAftermath(aftermath) } : {}),
             ...(error instanceof ExecuteCodeError ? {} : { setupFailed: true as const }),
           }
         },
@@ -377,21 +400,20 @@ export class ExecuteSandbox extends DefaultPageHost {
     if (logCompactionWarning) {
       warnings.push(logCompactionWarning)
     }
-    return warnings.map((warning) => this.secrets.redactOutputText(warning))
+    return warnings.map((warning) => this.networkCapture.redactText(warning))
   }
 
   redactNetworkCaptureText(text: string): string {
-    return this.secrets.redactOutputText(text)
+    return this.networkCapture.redactText(text)
   }
 
   /**
-   * Stops a running script from outside (the toolbar's stop, session delete/reset): closes its browser connection so
-   * every Playwright call it makes rejects, and disposes its realm (pending runs reject, timers are revoked; `state` resets).
-   * The session manager relies on this hook; keep it when the realm changes.
+   * Stops a running script's code at once (the toolbar's stop, session delete/reset): pending runs reject and timers
+   * are revoked. Synchronous on purpose, so a stop takes effect before anything the caller does next. The session
+   * manager relies on this hook; keep it synchronous when the realm changes.
    */
-  abortExecution(): Effect.Effect<void, Error> {
+  stopRealm(): void {
     this.realm?.dispose(new Error("Execute stopped: the session was stopped, deleted or reset"))
-    return this.disconnectSettled()
   }
 
   disconnectSettled(): Effect.Effect<void, Error> {
@@ -402,6 +424,16 @@ export class ExecuteSandbox extends DefaultPageHost {
       sandbox.state = sandbox.realm?.state ?? {}
       // Routes, listeners, init scripts and CDP sessions belong to the browser connection closed below.
       const browser = sandbox.browser
+      // Start the close before the first yield, while the reference is still held: an interrupted disconnect must not
+      // leave a connection open with nothing pointing at it. Cancel does no CDP work of its own (it discards pending
+      // capture work and waits only for finalizers already running, whose failures are caught), so the two can overlap.
+      const closing = yield* (browser
+        ? runPlaywrightOperation({
+            label: "Disconnect sandbox browser after handoff cancellation",
+            timeoutMs: playwrightCloseTimeoutMs,
+            run: () => browser.close(),
+          }).pipe(Effect.ignore)
+        : Effect.void).pipe(Effect.forkDetach({ startImmediately: true }))
       sandbox.browser = undefined
       sandbox.unbindDefaultPage(sandbox.defaultPageTargetId, {
         ownsPage: sandbox.ownsPage,
@@ -409,12 +441,7 @@ export class ExecuteSandbox extends DefaultPageHost {
         pageProtectedUi: sandbox.pageProtectedUi,
       })
       yield* sandbox.networkCapture.cancel()
-      if (browser) {
-        yield* runSettledPlaywrightOperation({
-          label: "Disconnect sandbox browser after handoff cancellation",
-          run: () => browser.close(),
-        }).pipe(Effect.ignore)
-      }
+      yield* Fiber.join(closing)
     })
   }
 
@@ -431,15 +458,19 @@ export class ExecuteSandbox extends DefaultPageHost {
       if (options.clearState) for (const key of Object.keys(sandbox.state)) delete sandbox.state[key]
       yield* sandbox.networkCapture.cancel()
 
+      // Bounded: a page whose tab the relay lost track of never reports closed, and a session's close is tracked work,
+      // so an unbounded close held every later relay restart (and so every auto-update) until the relay died.
       if (ownsOpenPage) {
-        yield* runSettledPlaywrightOperation({
+        yield* runPlaywrightOperation({
           label: "Close sandbox page after adoption",
+          timeoutMs: playwrightCloseTimeoutMs,
           run: () => page.close(),
         }).pipe(Effect.ignore)
       }
       if (browser) {
-        yield* runSettledPlaywrightOperation({
+        yield* runPlaywrightOperation({
           label: "Close sandbox browser connection after adoption",
+          timeoutMs: playwrightCloseTimeoutMs,
           run: () => browser.close(),
         }).pipe(Effect.ignore)
       }
@@ -517,6 +548,7 @@ export class ExecuteSandbox extends DefaultPageHost {
     const browser = this.browser
     const context = browser.contexts()[0] ?? (await browser.newContext())
     await registerAriaSnapshotSelector(context)
+    await registerRefSelector(context)
     installDownloadCapabilityGuards(context)
     return { browser, context }
   }
@@ -561,17 +593,35 @@ export class ExecuteSandbox extends DefaultPageHost {
       page = await this.getSessionPage({ context, ...(targetSelection ? { targetSelection } : {}) })
     }
     installPageReadTimeout(page)
-    installViewportZoomGuard({
-      page,
-      explicitMediaFeatures: this.explicitMediaFeatures,
-      getExplicitMedia: () => this.explicitMedia,
-      setExplicitMedia: (media) => {
-        this.explicitMedia = media
-      },
-      addWarningOnce: (warning) => this.addWarningOnce(warning),
-    })
+    // The page this call drives, and its context for pages the code opens itself.
+    this.actionTimeoutContext = context
+    context.setDefaultTimeout?.(this.actionTimeoutMs)
+    this.applyActionTimeout(page)
+    this.installViewportGuards(context)
     this.networkCapture.bindPage(this.page)
     return { browser, context, page }
+  }
+
+  /**
+   * Tracks viewport changes on every page the script can reach, not only the default page:
+   * `context.newPage()` and pages opened during the script must be restored too.
+   */
+  private installViewportGuards(context: BrowserContext): void {
+    const install = (page: Page) =>
+      installViewportZoomGuard({
+        page,
+        explicitMediaFeatures: this.explicitMediaFeatures,
+        getExplicitMedia: () => this.explicitMedia,
+        setExplicitMedia: (media) => {
+          this.explicitMedia = media
+        },
+        addWarningOnce: (warning) => this.addWarningOnce(warning),
+      })
+    for (const page of context.pages()) install(page)
+    if (!this.viewportGuardContexts.has(context)) {
+      context.on("page", install)
+      this.viewportGuardContexts.add(context)
+    }
   }
 
   private ensureSessionPage(label: string): Effect.Effect<Page, Error> {
@@ -591,7 +641,6 @@ export class ExecuteSandbox extends DefaultPageHost {
       realm: this.realm,
       snapshotRefs: this.snapshotRefs,
       networkCapture: this.networkCapture,
-      secrets: this.secrets,
       requestHandoff: this.options.requestHandoff,
       isRecordingTarget: this.options.isRecordingTarget,
       isDefaultPage: (candidate) => candidate === this.page,
@@ -633,8 +682,8 @@ export class ExecuteSandbox extends DefaultPageHost {
     return this.networkCapture.status()
   }
 
-  networkStop(options: NetworkCapture.NetworkCaptureStopOptions = {}): Effect.Effect<NetworkCapture.NetworkCaptureResult, Error> {
-    return this.networkCapture.stop(options)
+  networkStop(): Effect.Effect<NetworkCapture.NetworkCaptureResult, Error> {
+    return this.networkCapture.stop()
   }
 
   networkCancel(): Effect.Effect<{ readonly cancelled: boolean }> {
@@ -643,32 +692,6 @@ export class ExecuteSandbox extends DefaultPageHost {
 
   networkEnd(reason: string): Effect.Effect<{ readonly cancelled: boolean }> {
     return this.networkCapture.end(reason)
-  }
-
-  authRefresh(options: {
-    readonly name: string
-    readonly urlFilter?: string
-    readonly timeoutMs?: number
-  }): Effect.Effect<NetworkCapture.NetworkCaptureResult, Error> {
-    const sandbox = this
-    return Effect.gen(function* () {
-      const page = yield* sandbox.ensureSessionPage("Set up page for auth refresh")
-      yield* AuthProfile.read(options.name).pipe(Effect.asVoid)
-      yield* sandbox.networkCapture.start(page, {
-        ...(options.urlFilter ? { urlFilter: options.urlFilter } : {}),
-      })
-      return yield* Effect.gen(function* () {
-        yield* Effect.tryPromise({
-          try: () => page.reload({ waitUntil: "domcontentloaded", timeout: options.timeoutMs ?? 30_000 }),
-          catch: (cause) => cause instanceof Error ? cause : new Error("Refresh auth profile", { cause }),
-        })
-        yield* Effect.tryPromise({
-          try: () => page.waitForLoadState("networkidle", { timeout: Math.min(options.timeoutMs ?? 30_000, 5_000) }).catch(() => {}),
-          catch: (cause) => cause instanceof Error ? cause : new Error("Wait for auth refresh network", { cause }),
-        })
-        return yield* sandbox.networkCapture.stop({ secrets: options.name, requireObservedSecrets: true })
-      }).pipe(Effect.ensuring(sandbox.networkCapture.cancel()))
-    }).pipe(Effect.uninterruptible)
   }
 
   /** fillInput sets values directly: the page sees untrusted input events without key presses. */

@@ -1,6 +1,6 @@
 import type { Effect, Semaphore } from "effect"
 import type { ExecuteOptions, ExecuteResult } from "../execute.ts"
-import type { NetworkCaptureOptions, NetworkCaptureResult, NetworkCaptureStatus, NetworkCaptureStopOptions } from "../network-capture.ts"
+import type { NetworkCaptureOptions, NetworkCaptureResult, NetworkCaptureStatus } from "../network-capture.ts"
 import type { JsonObject, TargetInfo } from "../protocol.ts"
 import type { AuthenticatedJsonOutcome, AuthenticatedJsonRequest, SessionSummary } from "./schema.ts"
 export type SessionTarget = {
@@ -51,23 +51,22 @@ export interface ExecuteSandboxLike {
   execute(code: string, options?: ExecuteOptions): Effect.Effect<ExecuteResult>
   authenticatedJson(request: Omit<AuthenticatedJsonRequest, "sessionId">): Effect.Effect<AuthenticatedJsonOutcome, Error>
   adoptPage(targetId: string): Effect.Effect<void, Error>
-  /** Stop a running script: its Playwright calls reject and its timers stop; the default tab is kept. */
-  abortExecution(): Effect.Effect<void, Error>
+  /** Stop a running script at once: its pending runs reject and its timers stop; the default tab is kept. */
+  stopRealm(): void
   /** Shutdown and handoff cancellation await disconnection without closing or forgetting the default tab. */
   disconnectSettled(): Effect.Effect<void, Error>
   /** Adoption rollback cleanup does not settle before started Playwright close promises settle. */
   closeSettled(options?: { readonly clearState?: boolean }): Effect.Effect<void, Error>
   networkStart(options?: NetworkCaptureOptions): Effect.Effect<NetworkCaptureStatus, Error>
   networkStatus(): NetworkCaptureStatus
-  networkStop(options?: NetworkCaptureStopOptions): Effect.Effect<NetworkCaptureResult, Error>
+  networkStop(): Effect.Effect<NetworkCaptureResult, Error>
   networkCancel(): Effect.Effect<{ readonly cancelled: boolean }>
   /** Ends an active capture without a result, saying why on the next status or stop. */
   networkEnd(reason: string): Effect.Effect<{ readonly cancelled: boolean }>
-  authRefresh(options: { readonly name: string; readonly urlFilter?: string; readonly timeoutMs?: number }): Effect.Effect<NetworkCaptureResult, Error>
   redactNetworkCaptureText(text: string): string
   markTargetCrashed(targetId: string): boolean
   markTargetProtectedUi(targetId: string, protectedUi: boolean): boolean
-  markTargetDetached(targetId: string): boolean
+  markTargetDetached(targetId: string, options?: { readonly releasedByUser?: boolean }): boolean
   markTargetReplaced(previousTargetId: string, targetId: string): boolean
   /** Rebind a durable default target in a new sandbox; `warning` goes into the next execute result. */
   restore(target: SessionTarget | undefined, warning?: string): void
@@ -85,6 +84,11 @@ export type OpenCodeBrowserSession = {
   readonly readOnly: boolean
   /** Normalized allowed-origin patterns (domain-policy.ts); undefined: the session may go anywhere. */
   allowedOrigins?: readonly string[]
+  /**
+   * Keep this session's own tabs visible and focused to the page between execute calls, for apps that pause or
+   * disconnect while hidden. Tabs the user lent are never kept. Pages can notice.
+   */
+  keepVisible?: boolean
   /** The immutable profile key, plus its agent-facing id. Older catalogs recorded at most the id. */
   browser?: { readonly id: string; readonly key?: string }
   /** Replaced when a stopped script does not settle in time (session-manager.ts). */
@@ -92,6 +96,11 @@ export type OpenCodeBrowserSession = {
   readonly executeSemaphore: Semaphore.Semaphore
   /** Durable default-target identity. Authoritative live ownership remains in TargetRegistry. */
   target?: SessionTarget
+  /**
+   * Relay-owned targets the session held when the catalog was written (its default page included), restored at
+   * startup so every page and popup it opened is reclaimed. Live ownership remains in TargetRegistry.
+   */
+  targets?: readonly SessionTarget[]
   updatedAt: string
   /** The process that last used the session (OpenCode-Browser-Client-Pid); see OpenCodeBrowserSessions.noteClient. */
   clientPid?: number

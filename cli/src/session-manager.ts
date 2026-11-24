@@ -1,6 +1,7 @@
 import { Deferred, Effect, Option, Semaphore } from "effect"
 import { ExecuteSandbox, type ExecuteTargetSelection } from "./execute.ts"
-import type { NetworkCaptureOptions, NetworkCaptureResult, NetworkCaptureStatus, NetworkCaptureStopOptions } from "./network-capture.ts"
+import { ExecuteCpuScheduler } from "./execute-realm.ts"
+import type { NetworkCaptureOptions, NetworkCaptureResult, NetworkCaptureStatus } from "./network-capture.ts"
 import { generateSessionId } from "./relay/helpers.ts"
 import type { AuthenticatedJsonOutcome, AuthenticatedJsonRequest } from "./relay/schema.ts"
 import type { ConnectedTarget, ExecuteSandboxLike, OpenCodeBrowserSession, SessionSummary, SessionTarget } from "./relay/types.ts"
@@ -9,11 +10,13 @@ import { SessionAdmission } from "./session-manager/admission.ts"
 import { adoptTargetForSession, closeSessionSettledWithTimeout, sessionRelayTargetIds, type AdoptionContext } from "./session-manager/adoption.ts"
 import { executeInSession, type ExecutionContext } from "./session-manager/execution.ts"
 import {
+  defaultShutdownTimeoutMs,
   sessionError,
   sessionSummary,
   trySession,
   type AdoptionResult,
   type ExecutionResponse,
+  type PendingSessionWork,
   type RunningExecution,
   type SessionCreateOptions,
   type SessionExecuteRecord,
@@ -29,6 +32,7 @@ import {
 export {
   adoptionTipForUrl,
   defaultExecuteTimeoutMs,
+  defaultShutdownTimeoutMs,
   SessionError,
   shouldAppendAdoptionTip,
   type SessionExecuteRecord,
@@ -37,7 +41,7 @@ export {
 } from "./session-manager/types.ts"
 
 /**
- * Session ids an MCP server picks for itself (the MCP supervisor and `browse mcp` both use eight hex characters).
+ * Session ids an MCP server picks for itself (`browse mcp` uses eight hex characters).
  * Shared with the relay's orphan collector so both agree on which sessions nobody named.
  */
 const mcpSessionPattern = /^mcp-[0-9a-f]{8}$/i
@@ -53,6 +57,8 @@ export function isAutoNamedSession(id: string): boolean {
 
 export class OpenCodeBrowserSessions {
   readonly sessions = new Map<string, OpenCodeBrowserSession>()
+  /** One per relay: every session's execute realm shares the event loop through it. */
+  readonly cpuScheduler = new ExecuteCpuScheduler()
   private readonly createSandbox: (id: string, onDefaultTargetChange: (target: SessionTarget | undefined) => void) => ExecuteSandboxLike
   private readonly hooks: SessionHooks
   private readonly executing = new Set<string>()
@@ -70,7 +76,7 @@ export class OpenCodeBrowserSessions {
     hooks?: SessionHooks,
     targetOwnership?: TargetOwnership,
   ) {
-    this.createSandbox = createSandbox ?? ((id, onDefaultTargetChange) => new ExecuteSandbox({ endpointUrl: this.endpointUrl, sessionId: id, onDefaultTargetChange }))
+    this.createSandbox = createSandbox ?? ((id, onDefaultTargetChange) => new ExecuteSandbox({ endpointUrl: this.endpointUrl, sessionId: id, onDefaultTargetChange, cpuScheduler: this.cpuScheduler }))
     this.hooks = hooks ?? {}
     this.targetOwnership = targetOwnership ?? new MemoryTargetOwnership()
     this.admission = new SessionAdmission(this.sessions, this.hooks)
@@ -86,6 +92,7 @@ export class OpenCodeBrowserSessions {
       closeOpenCodeBrowserSessionSettled: (session) => this.closeOpenCodeBrowserSessionSettled(session),
       closeRelayTarget: (targetId) => this.closeRelayTarget(targetId),
       releaseSessionTargetOwnership: (session) => this.releaseSessionTargetOwnership(session),
+      clearSessionDefaultTarget: (session, targetId, options) => this.clearSessionDefaultTarget(session, targetId, options),
       notifyTargetOwnershipChange: (change) => this.notifyTargetOwnershipChange(change),
     }
     this.executionContext = {
@@ -106,42 +113,196 @@ export class OpenCodeBrowserSessions {
   }
 
   listSummaries(): SessionSummary[] {
-    return Array.from(this.sessions.values()).map((session) => sessionSummary(session))
+    return Array.from(this.sessions.values()).map((session) => sessionSummary(session, this.hooks))
   }
 
   restore(entries: readonly PersistedSession[]): void {
     this.admission.assertAdmission()
     if (this.sessions.size > 0) throw new Error("Cannot restore sessions after session management has started")
-    const ids = new Set<string>()
-    const targetOwners = new Set<string>()
+    const sessionIds = new Set<string>()
+    const accepted: PersistedSession[] = []
     for (const entry of entries) {
-      if (ids.has(entry.id)) throw new Error(`Duplicate persisted session: ${entry.id}`)
-      ids.add(entry.id)
-      if (entry.target && targetOwners.has(entry.target.id)) {
-        throw new Error(`Duplicate persisted target owner: ${entry.target.id}`)
+      if (sessionIds.has(entry.id)) {
+        this.warnRestore(`duplicate session ${entry.id}; later entry dropped`)
+        continue
       }
-      if (entry.target) targetOwners.add(entry.target.id)
+      sessionIds.add(entry.id)
+      accepted.push(entry)
     }
-    for (const entry of entries) {
+    const targetOwners = new Map<string, string>()
+    for (const entry of accepted) {
+      const target = this.acceptRestoredTarget(entry, entry.target, targetOwners)
+      const targets: SessionTarget[] = []
+      const seen = new Set<string>(target ? [target.id] : [])
+      for (const candidate of entry.targets ?? []) {
+        if ((candidate.owner as string) !== "relay") {
+          this.warnRestore(`session ${entry.id} held a non-relay target ${candidate.id}; target dropped`)
+          continue
+        }
+        if (seen.has(candidate.id)) {
+          this.warnRestore(`session ${entry.id} lists target ${candidate.id} twice; duplicate dropped`)
+          continue
+        }
+        const owner = targetOwners.get(candidate.id)
+        if (owner !== undefined && owner !== entry.id) {
+          this.warnRestore(`session ${entry.id} claims target ${candidate.id} of session ${owner}; target dropped`)
+          continue
+        }
+        targetOwners.set(candidate.id, entry.id)
+        seen.add(candidate.id)
+        targets.push(candidate)
+      }
       const session = this.createOpenCodeBrowserSession(entry.id, entry.readOnly, {
         createdAt: entry.createdAt,
         updatedAt: entry.updatedAt,
       })
       if (entry.allowedOrigins && entry.allowedOrigins.length > 0) session.allowedOrigins = entry.allowedOrigins
+      if (entry.keepVisible === true) session.keepVisible = true
       if (entry.browser) session.browser = { id: entry.browser, ...(entry.browserKey ? { key: entry.browserKey } : {}) }
-      if (entry.target) session.target = entry.target
+      if (target) session.target = target
+      if (targets.length > 0) session.targets = targets
       if (entry.clientPid !== undefined) session.clientPid = entry.clientPid
-      session.sandbox.restore(entry.target)
+      session.sandbox.restore(target)
       this.sessions.set(entry.id, session)
     }
   }
 
-  persistedTargetOwner(targetId: string): { readonly sessionId: string; readonly owner: "relay" | "user" } | undefined {
+  private acceptRestoredTarget(
+    entry: PersistedSession,
+    target: SessionTarget | undefined,
+    targetOwners: Map<string, string>,
+  ): SessionTarget | undefined {
+    if (!target) return undefined
+    const owner = targetOwners.get(target.id)
+    if (owner !== undefined && owner !== entry.id) {
+      this.warnRestore(`session ${entry.id} claims target ${target.id} of session ${owner}; target dropped`)
+      return undefined
+    }
+    targetOwners.set(target.id, entry.id)
+    return target
+  }
+
+  private warnRestore(message: string): void {
+    try {
+      if (this.hooks.onRestoreWarning) return this.hooks.onRestoreWarning(message)
+    } catch {
+      // The fallback line below is better than a failed startup.
+    }
+    console.error(`browse session restore: ${message}`)
+  }
+
+  persistedTargetOwner(
+    targetId: string,
+    options: { readonly includeHeldTargets?: boolean; readonly browserKey?: string; readonly legacy?: boolean } = {},
+  ): { readonly sessionId: string; readonly owner: "relay" | "user" } | undefined {
     for (const session of this.sessions.values()) {
+      if (options.browserKey !== undefined && session.browser?.key !== undefined && session.browser.key !== options.browserKey) continue
       const target = session.target
-      if (target?.id === targetId) return { sessionId: session.id, owner: target.owner }
+      if (target?.id === targetId && (options.includeHeldTargets !== false || target.owner === "user" || options.legacy === true)) {
+        return { sessionId: session.id, owner: target.owner }
+      }
+      if (options.includeHeldTargets === false) continue
+      const held = session.targets?.find((candidate) => candidate.id === targetId)
+      if (held) return { sessionId: session.id, owner: held.owner }
     }
     return undefined
+  }
+
+  /** A relay-owned page the session holds, recorded now so a relay restarted later reclaims it. */
+  noteTargetHeld(targetId: string, sessionId: string): void {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+    const targets = session.targets ?? []
+    if (targets.some((target) => target.id === targetId && target.owner === "relay")) return
+    session.targets = [...targets, { id: targetId, owner: "relay" }]
+    this.admission.schedulePersistence()
+  }
+
+  /** Clear a session's default target through its sandbox, so the next execute does not rebind the old page. */
+  clearSessionDefaultTarget(
+    session: OpenCodeBrowserSession,
+    targetId: string,
+    options: { readonly releasedByUser?: boolean; readonly reason?: string } = {},
+  ): boolean {
+    if (session.target?.id !== targetId) return false
+    session.sandbox.markTargetDetached(targetId, { releasedByUser: options.releasedByUser === true })
+    this.notifyTargetCleared(session.id, targetId, options.reason ?? "released")
+    this.updateTarget(session, undefined)
+    return true
+  }
+
+  /** Drop a target a session no longer holds (a user lend, an adoption): it must not be reclaimed again. */
+  forgetTargetHeld(targetId: string, options: { readonly releasedByUser?: boolean; readonly reason?: string } = {}): boolean {
+    let changed = false
+    for (const session of this.sessions.values()) {
+      let sessionChanged = false
+      if (session.target?.owner === "relay" && session.target.id === targetId) {
+        this.clearSessionDefaultTarget(session, targetId, options)
+        sessionChanged = true
+      }
+      if (session.targets?.some((target) => target.id === targetId)) {
+        const kept = session.targets.filter((target) => target.id !== targetId)
+        if (kept.length > 0) session.targets = kept
+        else delete session.targets
+        sessionChanged = true
+      }
+      changed ||= sessionChanged
+    }
+    if (changed) this.admission.schedulePersistence()
+    return changed
+  }
+
+  /**
+   * Keep only targets a settled inventory actually announced, for sessions in that browser, and dedupe them. Sessions
+   * with no browser key are only included when exactly one browser is connected/known. Returns the target ids removed.
+   */
+  pruneHeldTargets(options: {
+    readonly browserKey: string
+    readonly liveTargetIds: ReadonlySet<string>
+    readonly includeUnknownBrowser: boolean
+  }): string[] {
+    const removed = new Set<string>()
+    let changed = false
+    for (const session of this.sessions.values()) {
+      if (session.browser?.key === undefined) {
+        if (!options.includeUnknownBrowser) continue
+      } else if (session.browser.key !== options.browserKey) {
+        continue
+      }
+      if (session.target && !options.liveTargetIds.has(session.target.id)) {
+        removed.add(session.target.id)
+        this.clearSessionDefaultTarget(session, session.target.id, { reason: "pruned" })
+        changed = true
+      }
+      if (session.targets === undefined) continue
+      const kept: SessionTarget[] = []
+      const seen = new Set<string>()
+      for (const target of session.targets) {
+        if (!options.liveTargetIds.has(target.id) || seen.has(target.id)) {
+          removed.add(target.id)
+          changed = true
+          continue
+        }
+        seen.add(target.id)
+        kept.push(target)
+      }
+      if (kept.length > 0) session.targets = kept
+      else delete session.targets
+    }
+    if (changed) this.admission.schedulePersistence()
+    return [...removed]
+  }
+
+  /** A deleted session's restored tabs are no longer live: a browser reconnect must close them. */
+  private tombstoneHeldTargets(session: OpenCodeBrowserSession): void {
+    const targetIds = new Set((session.targets ?? []).map((target) => target.id))
+    if (session.target?.owner === "relay") targetIds.add(session.target.id)
+    if (targetIds.size === 0) return
+    try {
+      this.hooks.onTombstoneRelayTargets?.(session.id, [...targetIds], session.browser?.key)
+    } catch (error) {
+      console.error("Session tombstone hook failed", error)
+    }
   }
 
   private updateTarget(session: OpenCodeBrowserSession, target: SessionTarget | undefined): void {
@@ -167,6 +328,7 @@ export class OpenCodeBrowserSessions {
     const browser = this.resolveBrowser(options?.browser)
     const session = this.createOpenCodeBrowserSession(sessionId, options?.readOnly === true)
     if (options?.allowedOrigins && options.allowedOrigins.length > 0) session.allowedOrigins = options.allowedOrigins
+    if (options?.keepVisible === true) session.keepVisible = true
     if (browser) session.browser = browser
     this.sessions.set(sessionId, session)
     this.admission.schedulePersistence()
@@ -190,10 +352,10 @@ export class OpenCodeBrowserSessions {
             id,
           )
         }
-        return sessionSummary(existing)
+        return sessionSummary(existing, manager.hooks)
       }
       const session = yield* manager.createPersistedSession(id, options)
-      return sessionSummary(session)
+      return sessionSummary(session, manager.hooks)
     }).pipe(Effect.uninterruptible))
   }
 
@@ -239,8 +401,13 @@ export class OpenCodeBrowserSessions {
       else delete session.allowedOrigins
       session.updatedAt = new Date().toISOString()
       manager.admission.schedulePersistence()
-      return sessionSummary(session)
+      return sessionSummary(session, manager.hooks)
     })
+  }
+
+  /** Whether the session keeps its own tabs visible to the page between execute calls. */
+  keepsTabsVisible(id: string): boolean {
+    return this.sessions.get(id)?.keepVisible === true
   }
 
   isExecuting(id: string): boolean {
@@ -344,14 +511,20 @@ export class OpenCodeBrowserSessions {
     return this.collectSessionIds((session) => session.sandbox.markTargetProtectedUi(targetId, protectedUi))
   }
 
-  markTargetDetached(targetId: string): string[] {
+  markTargetDetached(targetId: string, options: { readonly releasedByUser?: boolean; readonly reason?: string } = {}): string[] {
+    const reason = options.reason ?? (options.releasedByUser === true ? "released-by-user" : "detached")
     return this.collectSessionIds((session) => {
-      const detached = session.sandbox.markTargetDetached(targetId)
+      const detached = session.sandbox.markTargetDetached(targetId, options)
       if (session.target?.id === targetId && session.target.owner === "user") {
         this.notifyTargetOwnershipChange(this.targetOwnership.releaseTargetOwnership(targetId, session.id))
       }
       if (session.target?.id === targetId) {
+        this.notifyTargetCleared(session.id, targetId, reason)
         this.updateTarget(session, undefined)
+      }
+      if (session.targets?.some((target) => target.id === targetId)) {
+        session.targets = session.targets.filter((target) => target.id !== targetId)
+        this.admission.schedulePersistence()
       }
       return detached
     })
@@ -360,8 +533,26 @@ export class OpenCodeBrowserSessions {
   markTargetReplaced(previousTargetId: string, targetId: string): string[] {
     return this.collectSessionIds((session) => {
       if (session.target?.id === previousTargetId) this.updateTarget(session, { ...session.target, id: targetId })
+      if (session.targets?.some((target) => target.id === previousTargetId)) {
+        const seen = new Set<string>()
+        session.targets = session.targets.flatMap((target) => {
+          const id = target.id === previousTargetId ? targetId : target.id
+          if (seen.has(id)) return []
+          seen.add(id)
+          return [{ ...target, id }]
+        })
+        this.admission.schedulePersistence()
+      }
       return session.sandbox.markTargetReplaced(previousTargetId, targetId)
     })
+  }
+
+  private notifyTargetCleared(sessionId: string, targetId: string, reason: string): void {
+    try {
+      this.hooks.onTargetCleared?.(sessionId, targetId, reason)
+    } catch (error) {
+      console.error("Session target cleared hook failed", error)
+    }
   }
 
   delete(id: string): Effect.Effect<{ readonly deleted: boolean; readonly stopped?: SessionStopReport }, Error> {
@@ -381,8 +572,18 @@ export class OpenCodeBrowserSessions {
         yield* manager.admission.commitPersistence(() => Effect.sync(() => {
           manager.sessions.set(id, session)
         }))
+        // Restored targets that were never attached are not live to close now; tombstone them so the browser's next
+        // inventory closes their tabs instead of leaving an agent's work open under a session that no longer exists.
+        manager.tombstoneHeldTargets(session)
         yield* manager.releaseSessionTargetOwnership(session)
         yield* manager.closeOpenCodeBrowserSession(session)
+        yield* Effect.sync(() => {
+          try {
+            manager.hooks.onSessionDeleted?.(id)
+          } catch (error) {
+            console.error("Session deleted hook failed", error)
+          }
+        })
         return true
       })))
       return { deleted, ...(stopped ? { stopped } : {}) }
@@ -404,6 +605,7 @@ export class OpenCodeBrowserSessions {
         yield* manager.closeSessionRelayTargets(existing)
         const session = manager.createOpenCodeBrowserSession(id, existing.readOnly)
         if (existing.allowedOrigins) session.allowedOrigins = existing.allowedOrigins
+        if (existing.keepVisible) session.keepVisible = true
         if (existing.browser) session.browser = existing.browser
         if (existing.clientPid !== undefined) session.clientPid = existing.clientPid
         manager.sessions.set(id, session)
@@ -412,7 +614,16 @@ export class OpenCodeBrowserSessions {
         }))
         yield* manager.releaseSessionTargetOwnership(existing)
         yield* manager.closeOpenCodeBrowserSession(existing)
-        return sessionSummary(session)
+        // The id outlives the session object, so drop state keyed by it as a delete does (focus it kept, viewport
+        // overrides its script left).
+        yield* Effect.sync(() => {
+          try {
+            manager.hooks.onSessionDeleted?.(id)
+          } catch (error) {
+            console.error("Session reset hook failed", error)
+          }
+        })
+        return sessionSummary(session, manager.hooks)
       })))
       return { session, ...(stopped ? { stopped } : {}) }
     }))
@@ -434,16 +645,12 @@ export class OpenCodeBrowserSessions {
       : Effect.fail(sessionError("not-found", `Session not found: ${id}`, id))
   }
 
-  networkStop(id: string, options: NetworkCaptureStopOptions = {}): Effect.Effect<NetworkCaptureResult, Error> {
-    return this.withSessionOperation(id, "network stop", (session) => session.sandbox.networkStop(options))
+  networkStop(id: string): Effect.Effect<NetworkCaptureResult, Error> {
+    return this.withSessionOperation(id, "network stop", (session) => session.sandbox.networkStop())
   }
 
   networkCancel(id: string): Effect.Effect<{ readonly cancelled: boolean }, Error> {
     return this.withSessionOperation(id, "network cancel", (session) => session.sandbox.networkCancel())
-  }
-
-  authRefresh(id: string, options: { readonly name: string; readonly urlFilter?: string; readonly timeoutMs?: number }): Effect.Effect<NetworkCaptureResult, Error> {
-    return this.withSessionOperation(id, "auth refresh", (session) => session.sandbox.authRefresh(options))
   }
 
   private withSessionOperation<A>(
@@ -540,26 +747,53 @@ export class OpenCodeBrowserSessions {
     this.admission.resume()
   }
 
-  closeAll(): Effect.Effect<void> {
+  /**
+   * Relay shutdown: stop admitting, let accepted work finish and disconnect the sessions, but wait at most
+   * `timeoutMs`. A session whose work never finishes is reported through `onStalled` and dropped so the process can
+   * exit.
+   */
+  closeAll(options: {
+    readonly timeoutMs?: number
+    /** Sessions still holding work when the wait expired, called before they are dropped. */
+    readonly onStalled?: (sessions: readonly PendingSessionWork[]) => void
+  } = {}): Effect.Effect<void> {
     const manager = this
-    return Effect.gen(function* () {
+    // Persisting the catalog is the shutdown's only chance to record the sessions it held; a stuck write must not
+    // keep the process alive either.
+    const stalledFlushMs = 1_000
+    // Only the wait is interruptible (so the timeout can end it); naming, persisting and dropping stragglers is not.
+    return Effect.uninterruptible(Effect.gen(function* () {
       manager.admission.markClosed()
-      yield* manager.admission.beginDrain().pipe(Effect.ignore)
-      yield* manager.adoptSemaphore.withPermit(Effect.gen(function* () {
-        yield* Effect.forEach(Array.from(manager.sessions.values()), (session) => {
-          return session.executeSemaphore.withPermit(
-            manager.disconnectOpenCodeBrowserSession(session),
-          )
-        }, { concurrency: "unbounded", discard: true })
-        yield* manager.admission.flushPersistence().pipe(Effect.ignore)
-        manager.sessions.clear()
-      }))
-    }).pipe(Effect.uninterruptible)
+      yield* Effect.interruptible(Effect.gen(function* () {
+        yield* manager.admission.beginDrain().pipe(Effect.ignore)
+        yield* manager.adoptSemaphore.withPermit(Effect.gen(function* () {
+          yield* Effect.forEach(Array.from(manager.sessions.values()), (session) => {
+            return session.executeSemaphore.withPermit(
+              manager.disconnectOpenCodeBrowserSession(session),
+            )
+          }, { concurrency: "unbounded", discard: true })
+          yield* manager.admission.flushPersistence().pipe(Effect.ignore)
+          manager.sessions.clear()
+        }))
+      })).pipe(
+        Effect.timeoutOrElse({
+          duration: options.timeoutMs ?? defaultShutdownTimeoutMs,
+          orElse: () => Effect.gen(function* () {
+            options.onStalled?.(manager.admission.pendingWorkBySession())
+            yield* Effect.interruptible(manager.admission.flushPersistence()).pipe(
+              Effect.timeoutOrElse({ duration: stalledFlushMs, orElse: () => Effect.void }),
+              Effect.ignore,
+            )
+            manager.sessions.clear()
+          }),
+        }),
+      )
+    }))
   }
 
   summary(id: string): SessionSummary | undefined {
     const session = this.sessions.get(id)
-    return session ? sessionSummary(session) : undefined
+    return session ? sessionSummary(session, this.hooks) : undefined
   }
 
   /** Reaps idle auto-named and oc-* sessions; explicit (named) sessions keep their state and are never reset here. */
@@ -583,6 +817,7 @@ export class OpenCodeBrowserSessions {
         }
         const targetIds = sessionRelayTargetIds(manager.hooks, session)
         if (session.target) targetIds.add(session.target.id)
+        for (const held of session.targets ?? []) targetIds.add(held.id)
         if (Array.from(targetIds).some((id) => options.isTargetBusy?.(id))) continue
         const done = yield* manager.delete(session.id).pipe(Effect.map((result) => result.deleted), Effect.orElseSucceed(() => false))
         if (done) reaped.push(session.id)
@@ -662,9 +897,23 @@ export class OpenCodeBrowserSessions {
 
   private endStoppedScript(session: OpenCodeBrowserSession): Effect.Effect<void> {
     this.cancelSessionHandoff(session.id)
-    return session.sandbox.abortExecution().pipe(
-      Effect.timeoutOption(this.stopGraceMs()),
-      Effect.catchCause((cause) => Effect.sync(() => console.error("Abort stopped execute", cause))),
+    // User code stops first, synchronously, as before: nothing the script does runs after its caller was told it stopped.
+    session.sandbox.stopRealm()
+    // Then end a navigation it left pending, and only then close its browser connection. One stop grace covers both:
+    // the cancel may take at most half of it (never more than 2s), so the disconnect always starts within the grace.
+    const graceMs = this.stopGraceMs()
+    const cancelNavigation = this.hooks.onStoppingExecute?.(session)
+    const cancel = cancelNavigation === undefined
+      ? Effect.void
+      : cancelNavigation.pipe(
+          Effect.timeoutOption(Math.min(2_000, Math.floor(graceMs / 2))),
+          Effect.catchCause((cause) => Effect.sync(() => console.error("Cancel stopped execute navigation", cause))),
+          Effect.asVoid,
+        )
+    return cancel.pipe(
+      Effect.andThen(Effect.suspend(() => session.sandbox.disconnectSettled())),
+      Effect.timeoutOption(graceMs),
+      Effect.catchCause((cause) => Effect.sync(() => console.error("Disconnect stopped execute", cause))),
       Effect.asVoid,
     )
   }
@@ -722,6 +971,7 @@ export class OpenCodeBrowserSessions {
     if (session.target) ids.add(session.target.id)
     for (const id of ids) this.notifyTargetOwnershipChange(this.targetOwnership.releaseTargetOwnership(id, session.id))
     delete session.target
+    delete session.targets
     return Effect.void
   }
 

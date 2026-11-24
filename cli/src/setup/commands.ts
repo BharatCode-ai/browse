@@ -1,9 +1,8 @@
 import { spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs"
 import { networkInterfaces } from "node:os"
 import path from "node:path"
-import { createInterface } from "node:readline/promises"
 import { editAgentConfig } from "./agent-config.ts"
 import {
   bundledPairingCodeTtlMs,
@@ -16,16 +15,20 @@ import {
   revokeBrowserToken,
   writeExtensionPairing,
 } from "../relay/browser-pairing.ts"
-import { cliCommand, compiledBinary, defaultSettingsPath, entryCommand, installedBinaryPath, installerBinaryPath, installCommand, runningEntry } from "../paths.ts"
-import { runCommand } from "../update/local-runtime.ts"
+import { syncDevExtension } from "./dev-extension.ts"
+import { cliCommand, compiledBinary, defaultSettingsPath, devExtensionFolder, entrySpawnCommand, installedBinaryPath, installerBinaryPath, installCommand, runningEntry } from "../paths.ts"
+import { runCommand } from "../update/auto-update.ts"
 import { unpackedExtensionId } from "../protocol.ts"
 import { parseHostname, readRelayConfig, writeRelayConfig } from "../relay/config.ts"
+import { defaultPort } from "../relay/helpers.ts"
+import { configuredRelayPort, endpointForPort, liveRelayPort, processAlive, probeRelayPort, readRelayState, resolveRelayPort, verifiedRelay, verifiedRelayEndpoint } from "../relay/port.ts"
 import { relayAuthorization } from "../relay/secrets.ts"
 import { opencodeBrowserBuildId } from "../version.ts"
 import { isInstallerBinary, removeBinaryInstall, samePath } from "./binary.ts"
 import { revealFolder } from "./browsers.ts"
 import {
   checkoutExtensionDirs,
+  dev,
   fail,
   files,
   fromSource,
@@ -41,6 +44,7 @@ import {
   type Settings,
 } from "./environment.ts"
 import { waitForExtension } from "./guidance.ts"
+import { remoteRelayAddresses } from "./remote.ts"
 import { configFile, removeLegacyHost, removeMcp } from "./mcp.ts"
 
 export type ExtensionStatus = {
@@ -53,9 +57,10 @@ export type ExtensionStatus = {
   protocolVersion?: number | null
 }
 
-export const relayBase = () => `http://127.0.0.1:${Number(process.env.OPENCODE_BROWSER_PORT) || 19989}`
+/** The running relay's endpoint, wherever it bound: the configured port or a fallback (relay/port.ts). */
+export const relayBase = () => endpointForPort(resolveRelayPort())
 
-/** The relay token header; the relay rejects every API request without it. */
+/** The relay token header; the relay rejects every API request without it. Never sent to the open /version probe. */
 const relayHeaders = (): Record<string, string> => {
   try {
     return { authorization: relayAuthorization() }
@@ -64,23 +69,66 @@ const relayHeaders = (): Record<string, string> => {
   }
 }
 
-export function ensureRelay(entry: string) {
-  const [file, ...prefix] = entryCommand(entry)
-  const started = spawnSync(file!, [...prefix, "session", "list", "--json"], {
+/**
+ * A setup request that may carry the relay token, sent only to an endpoint whose open /version proved it is a browse
+ * relay (and, when relay.json is trusted, the same instance). Undefined otherwise: another program holding the port
+ * never receives the token, and callers treat it as "no relay".
+ */
+async function relayRequest(
+  path: string,
+  options: {
+    readonly method?: string
+    readonly body?: string
+    readonly headers?: Record<string, string>
+    readonly timeoutMs?: number
+  } = {},
+): Promise<Response | undefined> {
+  const endpoint = await verifiedRelayEndpoint()
+  if (endpoint === undefined) return undefined
+  return fetch(`${endpoint}${path}`, {
+    ...(options.method === undefined ? {} : { method: options.method }),
+    ...(options.body === undefined ? {} : { body: options.body }),
+    headers: { ...relayHeaders(), ...options.headers },
+    redirect: "error",
+    signal: AbortSignal.timeout(options.timeoutMs ?? 3_000),
+  }).catch(() => undefined)
+}
+
+function startRelay(entry: string) {
+  const [file, ...prefix] = entrySpawnCommand(entry)
+  return spawnSync(file!, [...prefix, "session", "list", "--json"], {
     encoding: "utf8",
     timeout: 30_000,
   })
-  if (started.status !== 0)
-    fail(started.stderr?.trim() || `Couldn't reach the browse relay: ${started.error?.message || `run ${cliCommand("doctor")}`}`)
 }
 
-export const extensionStatus = (installWaiting = false) =>
-  fetch(`${relayBase()}/extension/status`, {
-    headers: { ...relayHeaders(), ...(installWaiting ? { "x-browse-install": "waiting" } : {}) },
-    signal: AbortSignal.timeout(3_000),
+function relayFailure(started: ReturnType<typeof startRelay>): string {
+  return started.stderr?.trim() || `Couldn't reach the browse relay: ${started.error?.message || `run ${cliCommand("status")}`}`
+}
+
+export function ensureRelay(entry: string) {
+  const started = startRelay(entry)
+  if (started.status !== 0) fail(relayFailure(started))
+}
+
+/** Starts the relay when it isn't running. Returns the failure reason, or undefined on success (callers may continue). */
+export function ensureRelayQuietly(entry: string): string | undefined {
+  const started = startRelay(entry)
+  return started.status === 0 ? undefined : relayFailure(started)
+}
+
+export const extensionStatus = async (installWaiting = false) => {
+  const response = await relayRequest("/extension/status", {
+    headers: installWaiting ? { "x-browse-install": "waiting" } : {},
+    timeoutMs: 3_000,
   })
-    .then((response) => (response.ok ? (response.json() as Promise<ExtensionStatus>) : undefined))
-    .catch(() => undefined)
+  if (!response?.ok) return undefined
+  try {
+    return (await response.json()) as ExtensionStatus
+  } catch {
+    return undefined
+  }
+}
 
 /** The extension connected to the relay, if any; a relay restarted moments ago waits a second or two for it. */
 export async function settledExtensionStatus(entry: string) {
@@ -107,15 +155,12 @@ export async function reloadOutdatedExtension(
   if (before.origin !== `chrome-extension://${unpackedExtensionId}`) return "current"
   const bundled = readJson<{ build?: string }>(path.join(folder, "build.json"))?.build
   if (bundled && before.build === bundled) return "current"
-  const sent = await fetch(`${relayBase()}/extension/reload`, {
+  const sent = (await relayRequest("/extension/reload", {
     method: "POST",
     body: "{}",
-    headers: { "content-type": "application/json", ...relayHeaders() },
-    signal: AbortSignal.timeout(5_000),
-  }).then(
-    (response) => response.ok,
-    () => false,
-  )
+    headers: { "content-type": "application/json" },
+    timeoutMs: 5_000,
+  }))?.ok === true
   if (!sent) return "stale"
   for (let attempt = 0; attempt < 20; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 500))
@@ -126,17 +171,32 @@ export async function reloadOutdatedExtension(
 }
 
 /**
+ * Puts this version's dev extension in <cache root>/extension (paired, for a developer who loads it), silently: install
+ * points every channel at the store build. Fails install when it can't be downloaded.
+ */
+export async function syncDev() {
+  if (!dev) return
+  try {
+    await syncDevExtension(dev, { root: paths.cache })
+  } catch (error) {
+    fail(`Could not get the dev extension: ${(error as Error).message}`)
+  }
+}
+
+/**
  * Writes a fresh one-time code into every unpacked extension folder this install manages (a checkout's, or a dev
  * install's). It's good for an hour and only until an extension used it, so the folder holds nothing reusable; an
- * extension that already has its key ignores it.
+ * extension that already has its key ignores it. The port is included only when a live relay recorded it: naming a
+ * port nothing listens on would send an unpaired extension to the wrong place.
  */
-export function pairUnpacked() {
-  const directories = checkoutExtensionDirs.filter((directory) =>
+export async function pairUnpacked() {
+  const directories = [...checkoutExtensionDirs, ...(dev ? [devExtensionFolder(paths.cache)] : [])].filter((directory) =>
     existsSync(path.join(directory, "manifest.json")),
   )
   if (directories.length === 0) return
+  const port = await liveRelayPort()
   const code = mintPairingCode(undefined, { ttlMs: bundledPairingCodeTtlMs })
-  for (const directory of directories) writeExtensionPairing(directory, code)
+  for (const directory of directories) writeExtensionPairing(directory, code, port)
 }
 
 export async function extension() {
@@ -144,15 +204,19 @@ export async function extension() {
   if (!folder) {
     if (!STORE_URL)
       fail(
-        "This package doesn't know its Chrome Web Store item. Use BharatCode Desktop or set up Browse from a checkout.",
+        "This package doesn't know its Chrome Web Store item. Install a released version (`npx @opencode/browse install`), or set up browse from a checkout.",
       )
     log(`Install browse from the Chrome Web Store: ${STORE_URL}`)
     log(`Then run \`${cliCommand("install")}\` again to pair it.`)
     return
   }
+  await syncDev()
   if (!existsSync(path.join(folder, "manifest.json")))
     fail(`${folder} has no built extension. Run \`${installCommand()}\` first.`)
-  pairUnpacked()
+  // The folder code names the live relay's port when one is running; otherwise it stays usable on 19988.
+  const failure = ensureRelayQuietly(readJson<Settings>(files.settings)?.entry ?? runningEntry())
+  if (failure) log(`! Couldn't start the relay: ${failure}`)
+  await pairUnpacked()
   revealFolder(folder)
   log(`Load unpacked from: ${folder}`)
 }
@@ -175,8 +239,13 @@ export async function pair(args: string[]) {
   ensureRelay(readJson<Settings>(files.settings)?.entry ?? runningEntry())
   const receipt = randomUUID()
   const code = mintPairingCode(undefined, { receipt })
+  const port = resolveRelayPort()
+  // A browser on another computer needs this machine's address, not localhost:<port>.
+  const remote = readRelayConfig().hostname === "0.0.0.0"
+    ? remoteRelayAddresses(networkInterfaces(), { port })[0]
+    : undefined
   log(`Pairing code: ${formatPairingCode(code)}`)
-  log(`${manualPair(code)} It works once, within ${pairingCodeTtlMs / 60_000} minutes.`)
+  log(`${manualPair(code, port, remote)} It works once, within ${pairingCodeTtlMs / 60_000} minutes.`)
   log(
     `Waiting up to ${timeoutMs / 1000}s for that browser. Later, \`${cliCommand("pair --list")}\` shows paired browsers.`,
   )
@@ -252,15 +321,20 @@ async function revokePairing(target: string | undefined) {
     return
   }
   // A running relay drops its connection now; any later connection fails pairing anyway.
-  const dropped = await fetch(`${relayBase()}/extension/revoke`, {
+  const response = await relayRequest("/extension/revoke", {
     method: "POST",
     body: JSON.stringify({ key: browser.key }),
-    headers: { "content-type": "application/json", ...relayHeaders() },
-    signal: AbortSignal.timeout(3_000),
-  }).then(
-    async (response) => (response.ok ? ((await response.json()) as { dropped?: boolean }).dropped === true : false),
-    () => false,
-  )
+    headers: { "content-type": "application/json" },
+    timeoutMs: 3_000,
+  })
+  let dropped = false
+  if (response?.ok) {
+    try {
+      dropped = ((await response.json()) as { dropped?: boolean }).dropped === true
+    } catch {
+      dropped = false
+    }
+  }
   log(
     `✓ Unpaired ${browser.id ?? browser.key}${dropped ? " and disconnected it" : ""}. To use it again, pair it with a new code.`,
   )
@@ -279,17 +353,18 @@ export async function set(args: string[]) {
   }
   writeRelayConfig({ ...readRelayConfig(), hostname })
   log(`✓ hostname is ${hostname}`)
-  const running = await fetch(`${relayBase()}/version`, { signal: AbortSignal.timeout(2000) }).then(
-    (response) => response.ok,
-    () => false,
-  )
+  const running = (await probeRelayPort(resolveRelayPort(), 2_000)) === "browse"
   if (running) {
-    const [file, ...prefix] = entryCommand(runningEntry())
+    const [file, ...prefix] = entrySpawnCommand(runningEntry())
     const restarted = spawnSync(file!, [...prefix, "relay", "restart"], { stdio: "inherit" })
     if (restarted.status !== 0)
       log(`! The relay is still running with the old hostname. Run \`${cliCommand("relay restart --force")}\` to apply it.`)
   }
   if (hostname === "127.0.0.1") return
+  // Like install --remote: start the relay when it wasn't running, then read the port it actually bound (a fallback).
+  // A relay that can't start here doesn't undo the saved hostname, and the address is still useful without a port note.
+  ensureRelayQuietly(readJson<Settings>(files.settings)?.entry ?? runningEntry())
+  const port = resolveRelayPort()
   const tailscale = Object.values(networkInterfaces())
     .flat()
     .find((address) => address?.family === "IPv4" && /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address.address))
@@ -298,34 +373,22 @@ export async function set(args: string[]) {
   log(
     "In the browser on the other computer, open browse's options (right-click its toolbar button, then Options),",
   )
-  log("and under Connection enter:")
-  log(`  Relay         ${tailscale ?? "this computer's address"}`)
+  log("and under advanced enter:")
+  log(`  Relay         ${(tailscale ?? "this computer's address") + (port === defaultPort ? "" : `:${port}`)}`)
   log(
     `  Pairing code  ${formatPairingCode(mintPairingCode())}  (works once, within ${pairingCodeTtlMs / 60_000} minutes; \`${cliCommand("pair")}\` prints another)`,
   )
   log("The connection isn't encrypted by browse: use it over Tailscale or a LAN you trust, not the open internet.")
 }
 
-/** Stored secret profiles are the one thing uninstall deletes that can't be recaptured without the user. */
-async function confirmSecretRemoval(args: string[]) {
-  const secrets = path.join(files.dir, "secrets")
-  const profiles = existsSync(secrets) ? readdirSync(secrets).filter((name) => name.endsWith(".json")) : []
-  if (profiles.length === 0 || args.includes("--yes") || args.includes("-y")) return
-  const notice = `Uninstalling deletes ${profiles.length} stored secret profile${profiles.length === 1 ? "" : "s"} in ${secrets}.`
-  if (!process.stdin.isTTY) fail(`${notice} Re-run with --yes to confirm.`)
-  const prompt = createInterface({ input: process.stdin, output: process.stdout })
-  const answer = await prompt.question(`${notice} Continue? [y/N] `).finally(() => prompt.close())
-  if (!/^y(es)?$/i.test(answer.trim())) fail("Uninstall cancelled; nothing was removed.")
-}
-
 /** Stop only a managed instance that recorded its identity in this install. Never start a relay during uninstall. */
 async function stopInstalledRelay() {
   const base = relayBase()
-  const audit = path.join(paths.state, "relays", new URL(base).port, "lifecycle.jsonl")
+  const audit = path.join(paths.state, "relays", String(configuredRelayPort()), "lifecycle.jsonl")
   if (!existsSync(audit)) return
   const probe = async () => {
     try {
-      const response = await fetch(`${base}/version`, { redirect: "error", signal: AbortSignal.timeout(2000) })
+      const response = await fetch(`${base}/version`, { redirect: "manual", signal: AbortSignal.timeout(2000) })
       return response.ok ? await response.json() as { managed?: boolean; instanceId?: string; shutdownProtocol?: number } : undefined
     } catch (error) {
       const e = error as { code?: string; cause?: { code?: string } }
@@ -342,23 +405,41 @@ async function stopInstalledRelay() {
   })
   if (!ours) return
   if (relay.shutdownProtocol !== 2) throw new Error("Stop the legacy relay manually, then run uninstall again.")
-  const response = await fetch(`${base}/shutdown`, {
+  // relay.json still names this relay while it writes its last lines as it stops (relay.ts cleanup): it is the marker
+  // that everything is on disk, so uninstall waits for it to go before deleting browse's folders.
+  const stillRecorded = () => {
+    const state = readRelayState()
+    return state !== undefined && state.instanceId === relay.instanceId && processAlive(state.pid)
+  }
+  // The token only goes to the endpoint and instance the probe above confirmed, and only while relay.json still agrees.
+  const verified = await verifiedRelay()
+  if (verified === undefined || verified.endpoint !== base || verified.instanceId !== relay.instanceId)
+    throw new Error("Could not verify the running relay; stop it manually, then run uninstall again.")
+  const response = await fetch(`${verified.endpoint}/shutdown`, {
     method: "POST", redirect: "error", headers: { ...relayHeaders(), "content-type": "application/json" }, signal: AbortSignal.timeout(15_000),
     body: JSON.stringify({ instanceId: relay.instanceId, requestId: randomUUID(), reason: "explicit-restart", force: true,
       client: { kind: "cli", instanceId: randomUUID(), buildId: opencodeBrowserBuildId } }),
   })
   if (!response.ok || !(await response.json() as { stopping?: boolean }).stopping) throw new Error("The running relay refused shutdown. Stop it manually, then run uninstall again.")
   for (let n = 0; n < 100; n++) {
-    const current = await probe()
-    if (!current) return
-    if (current.instanceId !== relay.instanceId) throw new Error("Another relay started during uninstall; no files were removed.")
+    const current = await probe().catch((error) => {
+      const e = error as { code?: string; cause?: { code?: string } }
+      // A stopping relay closes its sockets, so a reset here means wait and poll again; only a refusal means gone.
+      if (["ECONNRESET", "ConnectionClosed"].includes(e.cause?.code ?? e.code ?? "")) return "stopping" as const
+      throw error
+    })
+    if (current !== "stopping") {
+      if (!current) {
+        // It stopped answering but may still be writing: keep polling until relay.json goes or its process is gone.
+        if (!stillRecorded()) return
+      } else if (current.instanceId !== relay.instanceId) throw new Error("Another relay started during uninstall; no files were removed.")
+    }
     await new Promise(resolve => setTimeout(resolve, 50))
   }
   throw new Error("The relay is still stopping. Run uninstall again once it exits.")
 }
 
-export async function uninstall(args: string[]) {
-  await confirmSecretRemoval(args)
+export async function uninstall() {
   await stopInstalledRelay()
   const host = removeLegacyHost()
   const settings = readJson<Settings>(files.settings)
